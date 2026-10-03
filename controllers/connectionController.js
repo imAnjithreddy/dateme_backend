@@ -117,6 +117,52 @@ const sendRequest = async (req, res, next) => {
       }
     });
 
+    // Bidirectional Sync: Also ensure pending Friendship exists
+    try {
+      const Friendship = require('../models/Friendship');
+      let friendship = await Friendship.findOne({
+        $or: [
+          { requester: req.user._id, recipient: finalRecipientId },
+          { requester: finalRecipientId, recipient: req.user._id }
+        ]
+      });
+      if (!friendship) {
+        await Friendship.create({
+          requester: req.user._id,
+          recipient: finalRecipientId,
+          status: 'PENDING',
+          actionUserId: req.user._id
+        });
+      } else if (friendship.status !== 'ACCEPTED') {
+        friendship.requester = req.user._id;
+        friendship.recipient = finalRecipientId;
+        friendship.status = 'PENDING';
+        friendship.actionUserId = req.user._id;
+        await friendship.save();
+      }
+    } catch (fErr) {
+      console.warn('[Connection] Friendship request sync warning:', fErr.message);
+    }
+
+    // Live WebSocket Handshake Notification
+    try {
+      const { getIO } = require('../socket');
+      const io = req.app?.get('io') || getIO();
+      if (io) {
+        const payload = {
+          type: 'connection_request',
+          senderId: req.user._id.toString(),
+          senderName: req.user.name,
+          recipientId: finalRecipientId.toString(),
+          status: 'PENDING'
+        };
+        io.to(`user:${finalRecipientId.toString()}`).emit('friendship:status_changed', payload);
+        io.to(`user:${finalRecipientId.toString()}`).emit('friend:request_received', payload);
+      }
+    } catch (ioErr) {
+      console.warn('[Connection] Socket broadcast warning:', ioErr.message);
+    }
+
     return successResponse(
       res,
       { connection },
@@ -196,6 +242,55 @@ const respondRequest = async (req, res, next) => {
         }
       });
 
+      // Bidirectional Sync: Also set Friendship to ACCEPTED
+      try {
+        const Friendship = require('../models/Friendship');
+        let friendship = await Friendship.findOne({
+          $or: [
+            { requester: connection.requester._id, recipient: req.user._id },
+            { requester: req.user._id, recipient: connection.requester._id }
+          ]
+        });
+        if (friendship) {
+          friendship.status = 'ACCEPTED';
+          friendship.accepted_at = new Date();
+          friendship.actionUserId = req.user._id;
+          await friendship.save();
+        } else {
+          await Friendship.create({
+            requester: connection.requester._id,
+            recipient: req.user._id,
+            status: 'ACCEPTED',
+            actionUserId: req.user._id,
+            accepted_at: new Date()
+          });
+        }
+      } catch (fErr) {
+        console.warn('[Connection] Friendship sync warning:', fErr.message);
+      }
+
+      // Live WebSocket Handshake Notification
+      try {
+        const { getIO } = require('../socket');
+        const io = req.app?.get('io') || getIO();
+        if (io) {
+          const payload = {
+            type: 'connection_accepted',
+            partnerId: req.user._id.toString(),
+            partnerName: req.user.name,
+            targetUserId: connection.requester._id.toString(),
+            status: 'ACCEPTED',
+            isFriend: true
+          };
+          io.to(`user:${connection.requester._id.toString()}`).emit('friendship:status_changed', payload);
+          io.to(`user:${connection.requester._id.toString()}`).emit('friend:accepted', payload);
+          io.to(`user:${req.user._id.toString()}`).emit('friendship:status_changed', payload);
+          io.to(`user:${req.user._id.toString()}`).emit('friend:accepted', payload);
+        }
+      } catch (ioErr) {
+        console.warn('[Connection] Socket broadcast warning:', ioErr.message);
+      }
+
       return successResponse(
         res,
         { connection, match },
@@ -204,6 +299,42 @@ const respondRequest = async (req, res, next) => {
     } else {
       connection.status = 'declined';
       await connection.save();
+
+      // Bidirectional Sync: Also update Friendship to DECLINED
+      try {
+        const Friendship = require('../models/Friendship');
+        await Friendship.updateMany(
+          {
+            $or: [
+              { requester: connection.requester._id, recipient: req.user._id },
+              { requester: req.user._id, recipient: connection.requester._id }
+            ],
+            status: 'PENDING'
+          },
+          { status: 'DECLINED', actionUserId: req.user._id, declined_at: new Date() }
+        );
+      } catch (fErr) {
+        console.warn('[Connection] Friendship decline sync warning:', fErr.message);
+      }
+
+      // Live WebSocket Handshake Notification for decline
+      try {
+        const { getIO } = require('../socket');
+        const io = req.app?.get('io') || getIO();
+        if (io) {
+          const payload = {
+            type: 'connection_declined',
+            partnerId: req.user._id.toString(),
+            targetUserId: connection.requester._id.toString(),
+            status: 'DECLINED',
+            isFriend: false
+          };
+          io.to(`user:${connection.requester._id.toString()}`).emit('friendship:status_changed', payload);
+          io.to(`user:${connection.requester._id.toString()}`).emit('friend:declined', payload);
+        }
+      } catch (ioErr) {
+        console.warn('[Connection] Socket broadcast warning:', ioErr.message);
+      }
 
       return successResponse(res, { connection }, 'Connection request declined.');
     }
