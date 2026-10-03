@@ -94,11 +94,17 @@ const INITIAL_EVENTS = [
 
 const PlatformSetting = require('../models/PlatformSetting');
 
+const devLog = (...args) => {
+  if (process.env.NODE_ENV !== 'production') {
+    console.log(...args);
+  }
+};
+
 const seedInitialEventsAndClubs = async () => {
   try {
     // 0. Seed Platform Configuration & Campus Areas
     await PlatformSetting.getOrCreateDefault();
-    console.log('[Seed] Verified campus platform configuration and area hotspots.');
+    devLog('[Seed] Verified campus platform configuration and area hotspots.');
 
     // 1. Seed or Update Platform Admin
     const adminEmail = (process.env.INITIAL_ADMIN_EMAIL || 'tanush@dtabs.tech').toLowerCase().trim();
@@ -120,7 +126,7 @@ const seedInitialEventsAndClubs = async () => {
         onboardingCompleted: true,
         onlineStatus: ONLINE_STATUS.ONLINE
       });
-      console.log(`[Seed] Initial PLATFORM_ADMIN account created (${adminEmail}).`);
+      devLog(`[Seed] Initial PLATFORM_ADMIN account created (${adminEmail}).`);
     } else {
       admin.role = ROLES.PLATFORM_ADMIN;
       admin.password = adminPassword;
@@ -129,7 +135,7 @@ const seedInitialEventsAndClubs = async () => {
       admin.isSuspended = false;
       admin.isBanned = false;
       await admin.save();
-      console.log(`[Seed] PLATFORM_ADMIN credentials updated for (${adminEmail}).`);
+      devLog(`[Seed] PLATFORM_ADMIN credentials updated for (${adminEmail}).`);
     }
 
     // 1b. Seed / Update tanush.saha05@gmail.com as standard USER
@@ -150,7 +156,7 @@ const seedInitialEventsAndClubs = async () => {
         onboardingCompleted: true,
         onlineStatus: ONLINE_STATUS.ONLINE
       });
-      console.log(`[Seed] Created USER account for (${userEmail}) with password: ${userPassword}`);
+      devLog(`[Seed] Created USER account for (${userEmail}) with password: ${userPassword}`);
     } else {
       user2.role = ROLES.USER;
       user2.password = userPassword;
@@ -158,7 +164,7 @@ const seedInitialEventsAndClubs = async () => {
       user2.isSuspended = false;
       user2.isBanned = false;
       await user2.save();
-      console.log(`[Seed] Updated USER account for (${userEmail}) with password: ${userPassword}`);
+      devLog(`[Seed] Updated USER account for (${userEmail}) with password: ${userPassword}`);
     }
 
     // 1c. Seed / Update sahatanush511@gmail.com and sahatanush5@gmail.com
@@ -197,14 +203,14 @@ const seedInitialEventsAndClubs = async () => {
           onboardingCompleted: true,
           onlineStatus: ONLINE_STATUS.ONLINE
         });
-        console.log(`[Seed] Created test account for (${acc.email}) with password: ${acc.password}`);
+        devLog(`[Seed] Created test account for (${acc.email}) with password: ${acc.password}`);
       } else {
         u.password = acc.password;
         u.isVerified = true;
         u.isSuspended = false;
         u.isBanned = false;
         await u.save();
-        console.log(`[Seed] Updated test account for (${acc.email}) with password: ${acc.password}`);
+        devLog(`[Seed] Updated test account for (${acc.email}) with password: ${acc.password}`);
       }
       seededUsers.push(u);
     }
@@ -226,12 +232,12 @@ const seedInitialEventsAndClubs = async () => {
           status: 'ACCEPTED',
           accepted_at: new Date()
         });
-        console.log(`[Seed] Created ACCEPTED friendship between ${u1.email} and ${u2.email}`);
+        devLog(`[Seed] Created ACCEPTED friendship between ${u1.email} and ${u2.email}`);
       } else if (existingFriendship.status !== 'ACCEPTED') {
         existingFriendship.status = 'ACCEPTED';
         existingFriendship.accepted_at = new Date();
         await existingFriendship.save();
-        console.log(`[Seed] Updated friendship to ACCEPTED between ${u1.email} and ${u2.email}`);
+        devLog(`[Seed] Updated friendship to ACCEPTED between ${u1.email} and ${u2.email}`);
       }
     }
 
@@ -256,7 +262,7 @@ const seedInitialEventsAndClubs = async () => {
         });
       }
     }
-    console.log('[Seed] Verified 9 initial campus clubs.');
+    devLog('[Seed] Verified 9 initial campus clubs.');
 
     // 3. Seed Events
     for (const eventData of INITIAL_EVENTS) {
@@ -270,7 +276,7 @@ const seedInitialEventsAndClubs = async () => {
         });
       }
     }
-    console.log('[Seed] Verified initial campus events.');
+    devLog('[Seed] Verified initial campus events.');
   } catch (err) {
     console.error('[Seed] Error seeding initial data:', err.message);
   }

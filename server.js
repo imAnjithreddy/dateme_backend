@@ -78,7 +78,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Health check root
 app.get('/', (req, res) => {
   res.json({
-    platform: 'The Quad - Virtual Campus Social Platform',
+    platform: 'Datee_me - Campus Dating & Social Platform',
     status: 'online',
     version: '1.0.0',
     documentation: '/api/system/health'
@@ -93,8 +93,8 @@ app.use('/conversations', conversationRoutes);
 app.use('/api', routes);
 
 // 404 & Error Handling
-app.use(notFoundHandler);
-app.use(errorHandler);
+notFoundHandler && app.use(notFoundHandler);
+errorHandler && app.use(errorHandler);
 
 // Start server after DB connection
 const startServer = async () => {
@@ -102,12 +102,16 @@ const startServer = async () => {
     await connectDB();
     await seedInitialEventsAndClubs();
     server.listen(PORT, () => {
-      console.log(`===============================================`);
-      console.log(`  THE QUAD - VIRTUAL CAMPUS SOCIAL PLATFORM    `);
-      console.log(`  Backend Server running on port: ${PORT}     `);
-      console.log(`  Environment: ${process.env.NODE_ENV || 'development'}       `);
-      console.log(`  API Base URL: http://localhost:${PORT}/api   `);
-      console.log(`===============================================`);
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`===============================================`);
+        console.log(`  DATEE_ME - CAMPUS DATING & SOCIAL PLATFORM   `);
+        console.log(`  Backend Server running on port: ${PORT}     `);
+        console.log(`  Environment: ${process.env.NODE_ENV || 'development'}       `);
+        console.log(`  API Base URL: http://localhost:${PORT}/api   `);
+        console.log(`===============================================`);
+      } else {
+        console.log(`[Datee_me] Backend server started on port ${PORT}`);
+      }
     });
   } catch (error) {
     console.error('Fatal error starting backend server:', error);

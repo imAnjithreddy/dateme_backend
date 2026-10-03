@@ -298,7 +298,9 @@ const initSocket = (io) => {
       socket.join('campus:world');
       socket.join(`area:${initialArea}`);
 
-      console.log(`[Socket] ${playerState.displayName} joined campus area: ${initialArea} (${socket.id}) at (${posX}, ${posZ})`);
+      if (process.env.NODE_ENV !== 'production') {
+        console.log(`[Socket] ${playerState.displayName} joined campus area: ${initialArea} (${socket.id}) at (${posX}, ${posZ})`);
+      }
 
       // 1. Send all currently online players to the joining player
       socket.emit('campus:init', {
@@ -1105,7 +1107,9 @@ const initSocket = (io) => {
       // 1. Campus player presence cleanup
       const player = players.get(socket.id);
       if (player) {
-        console.log(`[Socket] Student left campus: ${player.displayName} (${socket.id})`);
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`[Socket] Student left campus: ${player.displayName} (${socket.id})`);
+        }
         players.delete(socket.id);
 
         // Broadcast to campus world that this player left
