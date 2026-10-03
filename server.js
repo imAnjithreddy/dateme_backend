@@ -23,7 +23,11 @@ const rawOrigins = (process.env.CLIENT_URL || 'http://localhost:3000')
   .map((u) => u.trim().replace(/\/$/, ''))
   .filter(Boolean);
 
-const defaultOrigins = ['http://localhost:3000', 'http://127.0.0.1:3000'];
+const defaultOrigins = [
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'https://dateme-frontend-ashy.vercel.app'
+];
 const allowedOrigins = Array.from(new Set([...rawOrigins, ...defaultOrigins]));
 
 const corsOriginChecker = (origin, callback) => {
