@@ -473,39 +473,68 @@ const initSocket = (io) => {
       // Check if player is inside an isolated private room
       const activePrivateRoomId = socketPrivateRooms.get(socket.id) || (data.campusArea === 'private-room' ? data.roomId : null);
       if (activePrivateRoomId) {
-        const roomMap = privateRoomOccupants.get(activePrivateRoomId.toString());
+        const roomIdStr = activePrivateRoomId.toString();
+        const roomMap = privateRoomOccupants.get(roomIdStr);
+        const posX = typeof data.x === 'number' ? data.x : (typeof data.position?.[0] === 'number' ? data.position[0] : 400);
+        const posY = typeof data.y === 'number' ? data.y : (typeof data.z === 'number' ? data.z : (typeof data.position?.[2] === 'number' ? data.position[2] : 420));
+        const facing = data.facing || (typeof data.rotation === 'string' ? data.rotation : 'down');
+        const isMoving = Boolean(data.isMoving);
+        const isSeated = Boolean(data.isSeated);
+        const animState = data.animationState || (isSeated ? 'sit' : (isMoving ? 'walk' : 'idle'));
+
         if (roomMap && roomMap.has(socket.id)) {
           const rp = roomMap.get(socket.id);
-          rp.x = data.x;
-          rp.y = data.z !== undefined ? data.z : data.y;
-          rp.rotation = data.rotation;
-          rp.animationState = data.animationState;
-          rp.isMoving = data.isMoving;
+          rp.x = posX;
+          rp.y = posY;
+          rp.rotation = facing;
+          rp.facing = facing;
+          rp.animationState = animState;
+          rp.isMoving = isMoving;
+          rp.isSeated = isSeated;
         }
 
-        // Broadcast movement ONLY to members inside room:${activePrivateRoomId}
-        socket.to(`room:${activePrivateRoomId.toString()}`).emit('private_room:peer_moved', {
+        const movePayload = {
           socketId: socket.id,
           userId: verifiedUserId,
           name: verifiedName,
-          x: data.x,
-          y: data.z !== undefined ? data.z : data.y,
-          rotation: data.rotation,
-          animationState: data.animationState,
-          isMoving: data.isMoving,
-          avatarConfig: socket.user?.avatar || data.avatar
-        });
+          x: posX,
+          y: posY,
+          facing,
+          rotation: facing,
+          animationState: animState,
+          isMoving,
+          isSeated,
+          avatarConfig: socket.user?.avatar || data.avatarConfig || data.avatar
+        };
+
+        // Broadcast movement to members inside room:${roomIdStr} and friend-lounge alias
+        socket.to(`room:${roomIdStr}`).emit('private_room:peer_moved', movePayload);
+        socket.to(`friend-lounge:${roomIdStr}`).emit('private_room:peer_moved', movePayload);
         return; // Strictly isolate private room movement from campus:world
       }
 
-      // Backward-compatible legacy broadcast for any non-snapshot listeners
+      // Backward-compatible legacy broadcast for any non-snapshot listeners (including DateeHomesLobby)
+      const posX = player.position[0];
+      const posY = player.position[2]; // 2D vertical coordinate corresponds to 3D z
+      const facing = typeof player.rotation === 'string' ? player.rotation : (typeof data.facing === 'string' ? data.facing : 'down');
+      const isMoving = player.animationState === 'walk';
+      const isSeated = player.animationState === 'sit';
+
       socket.to('campus:world').emit('player:moved', {
         socketId: socket.id,
         userId: player.userId,
+        name: player.name || verifiedName || 'Resident',
         position: player.position,
-        rotation: player.rotation,
+        x: posX,
+        y: posY,
+        z: posY,
+        rotation: facing,
+        facing,
         animationState: player.animationState,
-        campusArea: player.campusArea
+        isMoving,
+        isSeated,
+        campusArea: player.campusArea,
+        avatarConfig: socket.user?.avatar || player.avatar || {}
       });
     };
 

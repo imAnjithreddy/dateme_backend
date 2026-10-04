@@ -1,6 +1,6 @@
-require('dotenv').config();
-const http = require('http');
 const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+const http = require('http');
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
