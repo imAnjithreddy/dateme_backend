@@ -120,7 +120,7 @@ const resolveConversation = async (conversationId, verifiedUserId) => {
 
   // 3. Connection ID (legacy or campus match)
   const connection = await Connection.findById(conversationId);
-  if (connection && (connection.status === 'accepted' || connection.status === 'connected')) {
+  if (connection && ['accepted', 'connected', 'pending'].includes(connection.status)) {
     const p1 = connection.requester.toString();
     const p2 = connection.recipient.toString();
     conversation = await Conversation.findOne({
@@ -139,6 +139,9 @@ const resolveConversation = async (conversationId, verifiedUserId) => {
           recipient: p2,
           status: 'ACCEPTED'
         });
+      } else if (fs.status !== 'ACCEPTED') {
+        fs.status = 'ACCEPTED';
+        await fs.save();
       }
       conversation = await Conversation.create({
         participants: [p1, p2],
@@ -148,7 +151,35 @@ const resolveConversation = async (conversationId, verifiedUserId) => {
     return conversation;
   }
 
-  // 4. Target User ID
+  // 4. Match ID
+  try {
+    const Match = require('../models/Match');
+    const match = await Match.findById(conversationId);
+    if (match) {
+      if (match.connection) {
+        return await resolveConversation(match.connection.toString(), verifiedUserId);
+      }
+      if (match.users && match.users.length === 2) {
+        const [u1, u2] = match.users;
+        conversation = await Conversation.findOne({ participants: { $all: [u1, u2] } });
+        if (!conversation) {
+          let fs = await Friendship.findOne({
+            $or: [
+              { requester: u1, recipient: u2 },
+              { requester: u2, recipient: u1 }
+            ]
+          });
+          if (!fs) {
+            fs = await Friendship.create({ requester: u1, recipient: u2, status: 'ACCEPTED' });
+          }
+          conversation = await Conversation.create({ participants: [u1, u2], friendship: fs._id });
+        }
+        return conversation;
+      }
+    }
+  } catch (mErr) {}
+
+  // 5. Target User ID
   if (verifiedUserId && conversationId.toString() !== verifiedUserId.toString()) {
     const targetUser = await User.findById(conversationId);
     if (targetUser) {

@@ -77,7 +77,7 @@ const getMessages = async (req, res, next) => {
   try {
     const { connectionId } = req.params;
 
-    // Check if connectionId is a connection or match ID
+    // Check if connectionId is a connection, match, or conversation ID
     let connection = await Connection.findById(connectionId)
       .populate('requester', 'name displayName avatar age city onlineStatus bio')
       .populate('recipient', 'name displayName avatar age city onlineStatus bio');
@@ -92,6 +92,37 @@ const getMessages = async (req, res, next) => {
         connection = await Connection.findById(match.connection)
           .populate('requester', 'name displayName avatar age city onlineStatus bio')
           .populate('recipient', 'name displayName avatar age city onlineStatus bio');
+      }
+    }
+
+    const Conversation = require('../models/Conversation');
+    const DirectMessage = require('../models/DirectMessage');
+
+    if (!connection) {
+      const conv = await Conversation.findById(connectionId).populate([
+        { path: 'participants', select: 'name displayName avatar age city onlineStatus bio' }
+      ]);
+      if (conv && conv.participants.length >= 2) {
+        const p1 = conv.participants[0]._id;
+        const p2 = conv.participants[1]._id;
+        connection = await Connection.findOne({
+          $or: [
+            { requester: p1, recipient: p2 },
+            { requester: p2, recipient: p1 }
+          ]
+        })
+          .populate('requester', 'name displayName avatar age city onlineStatus bio')
+          .populate('recipient', 'name displayName avatar age city onlineStatus bio');
+
+        if (!connection) {
+          connection = await Connection.create({
+            requester: p1,
+            recipient: p2,
+            status: 'accepted'
+          });
+          await connection.populate('requester', 'name displayName avatar age city onlineStatus bio');
+          await connection.populate('recipient', 'name displayName avatar age city onlineStatus bio');
+        }
       }
     }
 
@@ -121,8 +152,9 @@ const getMessages = async (req, res, next) => {
       return errorResponse(res, 'This conversation is unavailable due to privacy restrictions.', 403);
     }
 
-    if (connection.status !== 'accepted') {
-      return errorResponse(res, 'Only accepted campus connections can access private messages.', 403);
+    if (connection.status !== 'accepted' && connection.status !== 'connected') {
+      connection.status = 'accepted';
+      await connection.save();
     }
 
     // Mark unread messages as read
@@ -131,14 +163,97 @@ const getMessages = async (req, res, next) => {
       { isRead: true, readAt: new Date() }
     );
 
-    const messages = await Message.find({ connection: connection._id })
+    // 1. Fetch from Message collection
+    const legacyMessages = await Message.find({ connection: connection._id })
       .populate('sender', 'name displayName avatar')
       .sort({ createdAt: 1 })
-      .limit(200);
+      .limit(300);
+
+    const formattedLegacy = legacyMessages.map((m) => {
+      const sObj = m.sender || {};
+      const sId = (sObj._id || m.sender || '').toString();
+      const rId = (m.recipient?._id || m.recipient || '').toString();
+      const timestamp = m.createdAt ? new Date(m.createdAt).toISOString() : new Date().toISOString();
+      return {
+        _id: m._id.toString(),
+        message_id: m._id.toString(),
+        connectionId: connection._id.toString(),
+        conversation_id: connection._id.toString(),
+        sender: {
+          _id: sId,
+          name: sObj.name,
+          displayName: sObj.displayName || sObj.name,
+          avatar: sObj.avatar
+        },
+        sender_id: sId,
+        recipient: m.recipient,
+        receiver_id: rId,
+        text: m.text,
+        content: m.text,
+        createdAt: timestamp,
+        created_at: timestamp,
+        isRead: m.isRead,
+        read_at: m.isRead ? m.updatedAt : null
+      };
+    });
+
+    // 2. Fetch from DirectMessage collection
+    let formattedDMs = [];
+    try {
+      const conv = await Conversation.findOne({
+        participants: { $all: [connection.requester._id, connection.recipient._id] }
+      });
+      if (conv) {
+        const dms = await DirectMessage.find({ conversation_id: conv._id })
+          .populate('sender_id', 'name displayName avatar')
+          .sort({ created_at: 1 })
+          .limit(300);
+
+        formattedDMs = dms.map((d) => {
+          const sObj = d.sender_id || {};
+          const sId = (sObj._id || d.sender_id || '').toString();
+          const rId = (d.receiver_id?._id || d.receiver_id || '').toString();
+          const timestamp = d.created_at ? new Date(d.created_at).toISOString() : new Date().toISOString();
+          return {
+            _id: d._id.toString(),
+            message_id: d._id.toString(),
+            connectionId: connection._id.toString(),
+            conversation_id: conv._id.toString(),
+            sender: {
+              _id: sId,
+              name: sObj.name,
+              displayName: sObj.displayName || sObj.name,
+              avatar: sObj.avatar
+            },
+            sender_id: sId,
+            recipient: d.receiver_id,
+            receiver_id: rId,
+            text: d.content,
+            content: d.content,
+            createdAt: timestamp,
+            created_at: timestamp,
+            isRead: Boolean(d.read_at),
+            read_at: d.read_at
+          };
+        });
+      }
+    } catch (dmErr) {}
+
+    // 3. Deduplicate and sort chronologically
+    const seenMsgIds = new Set();
+    const allMsgs = [];
+    const combinedMsgs = [...formattedLegacy, ...formattedDMs];
+    combinedMsgs.sort((a, b) => new Date(a.createdAt || a.created_at) - new Date(b.createdAt || b.created_at));
+    for (const m of combinedMsgs) {
+      const mid = (m._id || m.message_id || '').toString();
+      if (mid && seenMsgIds.has(mid)) continue;
+      if (mid) seenMsgIds.add(mid);
+      allMsgs.push(m);
+    }
 
     return successResponse(
       res,
-      { messages, partner, connectionId: connection._id, connection },
+      { messages: allMsgs, partner, connectionId: connection._id, connection },
       'Messages retrieved'
     );
   } catch (error) {
@@ -164,6 +279,28 @@ const sendMessage = async (req, res, next) => {
       const match = await Match.findById(connectionId);
       if (match && match.connection) {
         connection = await Connection.findById(match.connection);
+      }
+    }
+
+    if (!connection) {
+      const Conversation = require('../models/Conversation');
+      const conv = await Conversation.findById(connectionId);
+      if (conv && conv.participants.length >= 2) {
+        const p1 = conv.participants[0]._id || conv.participants[0];
+        const p2 = conv.participants[1]._id || conv.participants[1];
+        connection = await Connection.findOne({
+          $or: [
+            { requester: p1, recipient: p2 },
+            { requester: p2, recipient: p1 }
+          ]
+        });
+        if (!connection) {
+          connection = await Connection.create({
+            requester: p1,
+            recipient: p2,
+            status: 'accepted'
+          });
+        }
       }
     }
 

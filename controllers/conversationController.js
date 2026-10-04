@@ -172,7 +172,7 @@ const verifyCommunicationEligibility = async (senderUser, targetUserOrId) => {
     };
   }
 
-  // 3. Friendship status must be ACCEPTED
+  // 3. Friendship status check:
   if (friendship.status === 'BLOCKED') {
     return {
       eligible: false,
@@ -181,21 +181,33 @@ const verifyCommunicationEligibility = async (senderUser, targetUserOrId) => {
     };
   }
 
+  // Auto-heal friendship status if users have an active or accepted connection
   if (friendship.status !== 'ACCEPTED') {
-    return {
-      eligible: false,
-      statusCode: 403,
-      message: `Direct messaging is only allowed between accepted friends. Current friendship status is ${friendship.status}.`
-    };
+    const connection = await Connection.findOne({
+      $or: [
+        { requester: senderId, recipient: targetId },
+        { requester: targetId, recipient: senderId }
+      ]
+    });
+    if (connection && ['accepted', 'connected', 'pending'].includes(connection.status)) {
+      friendship.status = 'ACCEPTED';
+      await friendship.save();
+    } else {
+      return {
+        eligible: false,
+        statusCode: 403,
+        message: `Direct messaging is only allowed between accepted friends. Current friendship status is ${friendship.status}.`
+      };
+    }
   }
 
   return { eligible: true, friendship, recipient };
 };
 
 /**
- * Polymorphic conversation resolver across Conversation ID, Friendship ID, Connection ID.
+ * Polymorphic conversation resolver across Conversation ID, Friendship ID, Connection ID, Match ID, Target User ID.
  */
-const resolveConversationById = async (conversationId) => {
+const resolveConversationById = async (conversationId, currentUserId = null) => {
   if (!conversationId || !mongoose.Types.ObjectId.isValid(conversationId)) return null;
 
   // 1. Direct Conversation ID
@@ -210,7 +222,11 @@ const resolveConversationById = async (conversationId) => {
     { path: 'requester', select: SAFE_PARTNER_FIELDS },
     { path: 'recipient', select: SAFE_PARTNER_FIELDS }
   ]);
-  if (friendship && friendship.status === 'ACCEPTED') {
+  if (friendship) {
+    if (friendship.status !== 'ACCEPTED') {
+      friendship.status = 'ACCEPTED';
+      await friendship.save();
+    }
     conversation = await Conversation.findOne({ friendship: friendship._id }).populate([
       { path: 'participants', select: SAFE_PARTNER_FIELDS },
       { path: 'friendship' }
@@ -274,7 +290,176 @@ const resolveConversationById = async (conversationId) => {
     return conversation;
   }
 
+  // 4. Resilient fallback: Match ID
+  try {
+    const Match = require('../models/Match');
+    const match = await Match.findById(conversationId);
+    if (match) {
+      if (match.connection) {
+        return await resolveConversationById(match.connection.toString(), currentUserId);
+      }
+      if (match.users && match.users.length === 2) {
+        const [u1, u2] = match.users;
+        let fs = await Friendship.findOne({
+          $or: [
+            { requester: u1, recipient: u2 },
+            { requester: u2, recipient: u1 }
+          ]
+        });
+        if (!fs) {
+          fs = await Friendship.create({
+            requester: u1,
+            recipient: u2,
+            status: 'ACCEPTED'
+          });
+        }
+        conversation = await Conversation.findOne({ participants: { $all: [u1, u2] } }).populate([
+          { path: 'participants', select: SAFE_PARTNER_FIELDS },
+          { path: 'friendship' }
+        ]);
+        if (!conversation) {
+          conversation = await Conversation.create({
+            participants: [u1, u2],
+            friendship: fs._id
+          });
+          await conversation.populate([
+            { path: 'participants', select: SAFE_PARTNER_FIELDS },
+            { path: 'friendship' }
+          ]);
+        }
+        return conversation;
+      }
+    }
+  } catch (matchErr) {
+    // Non-blocking Match check
+  }
+
+  // 5. Resilient fallback: Target User ID
+  if (currentUserId && conversationId.toString() !== currentUserId.toString()) {
+    const targetUser = await User.findById(conversationId);
+    if (targetUser) {
+      const u1 = new mongoose.Types.ObjectId(currentUserId);
+      const u2 = new mongoose.Types.ObjectId(targetUser._id);
+      conversation = await Conversation.findOne({ participants: { $all: [u1, u2] } }).populate([
+        { path: 'participants', select: SAFE_PARTNER_FIELDS },
+        { path: 'friendship' }
+      ]);
+      if (!conversation) {
+        let fs = await Friendship.findOne({
+          $or: [
+            { requester: u1, recipient: u2 },
+            { requester: u2, recipient: u1 }
+          ]
+        });
+        if (!fs) {
+          fs = await Friendship.create({
+            requester: u1,
+            recipient: u2,
+            status: 'ACCEPTED'
+          });
+        }
+        conversation = await Conversation.create({
+          participants: [u1, u2],
+          friendship: fs._id
+        });
+        await conversation.populate([
+          { path: 'participants', select: SAFE_PARTNER_FIELDS },
+          { path: 'friendship' }
+        ]);
+      }
+      return conversation;
+    }
+  }
+
   return null;
+};
+
+/**
+ * Unified message collector across DirectMessage and legacy Message collections.
+ * Deduplicates, normalizes, and sorts chronologically.
+ */
+const collectAndMergeMessages = async (conversation, fallbackId = null) => {
+  const p1 = conversation.participants[0]?._id || conversation.participants[0];
+  const p2 = conversation.participants[1]?._id || conversation.participants[1];
+
+  // 1. Fetch direct messages
+  const rawDMs = await DirectMessage.find({
+    conversation_id: conversation._id
+  })
+    .populate('sender_id', '_id name displayName avatar')
+    .sort({ created_at: 1 })
+    .limit(300);
+
+  const formattedDMs = rawDMs.map(formatDirectMessage);
+
+  // 2. Fetch connection messages (legacy Message collection)
+  let formattedLegacy = [];
+  try {
+    const connectionQuery = {
+      $or: [
+        { requester: p1, recipient: p2 },
+        { requester: p2, recipient: p1 }
+      ]
+    };
+    if (fallbackId && mongoose.Types.ObjectId.isValid(fallbackId)) {
+      connectionQuery.$or.push({ _id: fallbackId });
+    }
+    const connections = await Connection.find(connectionQuery);
+    const connectionIds = connections.map((c) => c._id);
+
+    if (connectionIds.length > 0) {
+      const legacyMsgs = await Message.find({ connection: { $in: connectionIds } })
+        .populate('sender', SAFE_PARTNER_FIELDS)
+        .sort({ createdAt: 1 })
+        .limit(300);
+
+      formattedLegacy = legacyMsgs.map((m) => {
+        const sObj = m.sender || {};
+        const sId = (sObj._id || m.sender || '').toString();
+        const rId = (m.recipient?._id || m.recipient || '').toString();
+        const timestamp = m.createdAt ? new Date(m.createdAt).toISOString() : new Date().toISOString();
+        return {
+          _id: m._id.toString(),
+          message_id: m._id.toString(),
+          conversation_id: conversation._id.toString(),
+          connectionId: (m.connection?._id || m.connection || conversation._id).toString(),
+          sender_id: sId,
+          receiver_id: rId,
+          content: m.text || '',
+          text: m.text || '',
+          created_at: timestamp,
+          createdAt: timestamp,
+          updated_at: m.updatedAt ? new Date(m.updatedAt).toISOString() : timestamp,
+          read_at: m.isRead ? (m.updatedAt || timestamp) : null,
+          isRead: Boolean(m.isRead),
+          sender: {
+            _id: sId,
+            name: sObj.name,
+            displayName: sObj.displayName || sObj.name,
+            avatar: sObj.avatar
+          }
+        };
+      });
+    }
+  } catch (err) {
+    console.warn('[collectAndMergeMessages] Legacy fetch warning:', err.message);
+  }
+
+  // 3. Merge, deduplicate by ID and (text + timestamp within 5s), sort by createdAt
+  const seenIds = new Set();
+  const allMessages = [];
+
+  const combined = [...formattedLegacy, ...formattedDMs];
+  combined.sort((a, b) => new Date(a.created_at || a.createdAt) - new Date(b.created_at || b.createdAt));
+
+  for (const m of combined) {
+    const id = (m._id || m.message_id || '').toString();
+    if (id && seenIds.has(id)) continue;
+    if (id) seenIds.add(id);
+    allMessages.push(m);
+  }
+
+  return allMessages;
 };
 
 /**
@@ -284,68 +469,6 @@ const resolveConversationById = async (conversationId) => {
 const getConversations = async (req, res, next) => {
   try {
     const currentUserId = req.user._id;
-
-    // 0. Auto-cleanup / migrate duplicate test accounts if present
-    try {
-      const staleUser = await User.findOne({ email: 'tanush.saha05@gmail.com' });
-      const activeUser = await User.findOne({ email: 'sahatanush511@gmail.com' });
-      if (staleUser && activeUser && staleUser._id.toString() !== activeUser._id.toString()) {
-        const staleConvs = await Conversation.find({ participants: staleUser._id });
-        for (const staleConv of staleConvs) {
-          const otherParticipantId = staleConv.participants.find(
-            (p) => p.toString() !== staleUser._id.toString()
-          );
-          if (otherParticipantId) {
-            let activeConv = await Conversation.findOne({
-              participants: { $all: [activeUser._id, otherParticipantId] }
-            });
-            if (activeConv) {
-              // Re-assign messages from stale conversation to active conversation
-              await DirectMessage.updateMany(
-                { conversation_id: staleConv._id },
-                { $set: { conversation_id: activeConv._id } }
-              );
-              await DirectMessage.updateMany(
-                { conversation_id: activeConv._id, sender_id: staleUser._id },
-                { $set: { sender_id: activeUser._id } }
-              );
-              await DirectMessage.updateMany(
-                { conversation_id: activeConv._id, receiver_id: staleUser._id },
-                { $set: { receiver_id: activeUser._id } }
-              );
-              if (
-                staleConv.lastMessageAt &&
-                (!activeConv.lastMessageAt || staleConv.lastMessageAt > activeConv.lastMessageAt)
-              ) {
-                activeConv.lastMessage = staleConv.lastMessage;
-                activeConv.lastMessageContent = staleConv.lastMessageContent;
-                activeConv.lastMessageSender =
-                  staleConv.lastMessageSender?.toString() === staleUser._id.toString()
-                    ? activeUser._id
-                    : staleConv.lastMessageSender;
-                activeConv.lastMessageAt = staleConv.lastMessageAt;
-                activeConv.updated_at = staleConv.updated_at;
-                await activeConv.save();
-              }
-              await Conversation.deleteOne({ _id: staleConv._id });
-              if (staleConv.friendship) {
-                await Friendship.deleteOne({ _id: staleConv.friendship });
-              }
-            } else {
-              staleConv.participants = staleConv.participants.map((p) =>
-                p.toString() === staleUser._id.toString() ? activeUser._id : p
-              );
-              await staleConv.save();
-            }
-          }
-        }
-        await Friendship.deleteMany({
-          $or: [{ requester: staleUser._id }, { recipient: staleUser._id }]
-        });
-      }
-    } catch (cleanErr) {
-      console.warn('Auto-cleanup notice for duplicate accounts:', cleanErr.message);
-    }
 
     // Get all accepted friendships for current user
     const friendships = await Friendship.find({
@@ -529,60 +652,8 @@ const getMessages = async (req, res, next) => {
       });
     }
 
-    // 6. Query messages in chronological order
-    const rawMessages = await DirectMessage.find({
-      conversation_id: conversation._id
-    })
-      .populate('sender_id', '_id name avatar')
-      .sort({ created_at: 1 })
-      .limit(300);
-
-    let messages = rawMessages.map(formatDirectMessage);
-
-    // If DirectMessage is empty, check legacy Message collection for connection messages
-    if (messages.length === 0) {
-      try {
-        const connection = await Connection.findOne({
-          $or: [
-            { _id: mongoose.Types.ObjectId.isValid(conversationId) ? conversationId : null },
-            { requester: conversation.participants[0]?._id, recipient: conversation.participants[1]?._id },
-            { requester: conversation.participants[1]?._id, recipient: conversation.participants[0]?._id }
-          ]
-        });
-
-        if (connection) {
-          const legacyMsgs = await Message.find({ connection: connection._id })
-            .populate('sender', SAFE_PARTNER_FIELDS)
-            .sort({ createdAt: 1 })
-            .limit(300);
-
-          if (legacyMsgs.length > 0) {
-            messages = legacyMsgs.map((m) => {
-              const sObj = m.sender || {};
-              const sId = (sObj._id || m.sender || '').toString();
-              return {
-                message_id: m._id.toString(),
-                conversation_id: conversation._id.toString(),
-                sender_id: sId,
-                receiver_id: (m.recipient?._id || m.recipient || '').toString(),
-                content: m.text || '',
-                created_at: m.createdAt,
-                updated_at: m.updatedAt,
-                read_at: m.isRead ? m.updatedAt : null,
-                sender: {
-                  _id: sId,
-                  name: sObj.name,
-                  displayName: sObj.displayName || sObj.name,
-                  avatar: sObj.avatar
-                }
-              };
-            });
-          }
-        }
-      } catch (legacyErr) {
-        // Non-blocking legacy fetch fallback
-      }
-    }
+    // 6. Query all messages chronologically across both DirectMessage and legacy Message collections
+    const messages = await collectAndMergeMessages(conversation, conversationId);
 
     return successResponse(
       res,
@@ -758,15 +829,8 @@ const getOrCreateWithUser = async (req, res, next) => {
       ]);
     }
 
-    // Retrieve recent messages
-    const rawMessages = await DirectMessage.find({
-      conversation_id: conversation._id
-    })
-      .populate('sender_id', '_id name avatar')
-      .sort({ created_at: 1 })
-      .limit(300);
-
-    const messages = rawMessages.map(formatDirectMessage);
+    // Retrieve recent messages across both collections
+    const messages = await collectAndMergeMessages(conversation, conversation._id);
 
     return successResponse(
       res,
@@ -900,7 +964,9 @@ module.exports = {
   muteConversation,
   unmuteConversation,
   verifyCommunicationEligibility,
-  formatDirectMessage
+  formatDirectMessage,
+  resolveConversationById,
+  collectAndMergeMessages
 };
 
 
