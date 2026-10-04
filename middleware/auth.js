@@ -37,8 +37,17 @@ const authenticateUser = async (req, res, next) => {
     }
 
     if (user.isSuspended || user.isBlocked || user.isBanned) {
-      const reason = user.isBanned ? 'banned' : 'suspended';
-      return errorResponse(res, `Your account has been ${reason} for safety and policy compliance.`, 403);
+      if (user.isSuspended && user.suspendedUntil && new Date(user.suspendedUntil) <= new Date()) {
+        user.isSuspended = false;
+        user.suspendedUntil = null;
+        user.suspendReason = '';
+        await user.save();
+      } else {
+        const reason = user.isBanned ? 'banned' : 'suspended';
+        const detail = user.suspendReason || user.banReason || 'for safety and policy compliance.';
+        const timeInfo = user.suspendedUntil ? ` until ${new Date(user.suspendedUntil).toLocaleString()}` : '';
+        return errorResponse(res, `Your account has been ${reason}${timeInfo}. ${detail}`, 403);
+      }
     }
 
     req.user = user;

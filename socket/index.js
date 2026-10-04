@@ -50,25 +50,46 @@ const formatDirectMessage = (msg) => {
   const conversationId = (doc.conversation_id?._id || doc.conversation_id || '').toString();
   const senderId = (doc.sender_id?._id || doc.sender_id || '').toString();
   const receiverId = (doc.receiver_id?._id || doc.receiver_id || '').toString();
+  const content = doc.content || doc.text || '';
+  const timestamp = doc.created_at || doc.createdAt || new Date().toISOString();
 
-  const formatted = {
-    message_id: messageId,
-    conversation_id: conversationId,
-    sender_id: senderId,
-    receiver_id: receiverId,
-    content: doc.content || doc.text || '',
-    created_at: doc.created_at || doc.createdAt,
-    updated_at: doc.updated_at || doc.updatedAt,
-    read_at: doc.read_at || null
-  };
-
+  let senderObj = null;
   if (doc.sender_id && typeof doc.sender_id === 'object' && doc.sender_id.name) {
-    formatted.sender = {
+    senderObj = {
       _id: doc.sender_id._id,
       name: doc.sender_id.name,
+      displayName: doc.sender_id.displayName || doc.sender_id.name,
       avatar: doc.sender_id.avatar
     };
+  } else if (doc.sender && typeof doc.sender === 'object' && doc.sender.name) {
+    senderObj = {
+      _id: doc.sender._id,
+      name: doc.sender.name,
+      displayName: doc.sender.displayName || doc.sender.name,
+      avatar: doc.sender.avatar
+    };
+  } else if (senderId) {
+    senderObj = {
+      _id: senderId
+    };
   }
+
+  const formatted = {
+    _id: messageId,
+    message_id: messageId,
+    conversation_id: conversationId,
+    connectionId: conversationId,
+    sender_id: senderId,
+    sender: senderObj,
+    receiver_id: receiverId,
+    content: content,
+    text: content,
+    created_at: timestamp,
+    createdAt: timestamp,
+    updated_at: doc.updated_at || doc.updatedAt || timestamp,
+    read_at: doc.read_at || null,
+    isRead: Boolean(doc.read_at)
+  };
 
   return formatted;
 };
@@ -870,6 +891,13 @@ const initSocket = (io) => {
 
         const cleanText = String(text).trim().substring(0, 4000);
 
+        const { checkSocketMessageRateLimit } = require('../middleware/rateLimiter');
+        const rateCheck = checkSocketMessageRateLimit(socket.user._id);
+        if (!rateCheck.allowed) {
+          if (typeof callback === 'function') callback({ success: false, error: rateCheck.message });
+          return;
+        }
+
         const conversation = await resolveConversation(conversationId, verifiedUserId);
 
         if (!conversation) {
@@ -911,51 +939,37 @@ const initSocket = (io) => {
         conversation.updated_at = new Date();
         await conversation.save();
 
-        await Notification.create({
-          recipient: partnerId,
-          sender: socket.user._id,
-          type: 'new_message',
-          title: 'New Message',
-          message: `${verifiedName}: "${cleanText.substring(0, 60)}"`,
-          data: {
-            conversation_id: conversation._id.toString(),
-            message_id: directMessage._id.toString(),
-            actionUrl: `/messages?conversationId=${conversation._id}`
-          }
-        });
+        // Check if recipient has muted this conversation
+        const isMutedByPartner = conversation.mutedBy?.some((m) =>
+          (m.user?._id || m.user).toString() === partnerId.toString() &&
+          (!m.mutedUntil || new Date(m.mutedUntil) > new Date())
+        );
 
-        await directMessage.populate('sender_id', '_id name avatar');
+        if (!isMutedByPartner) {
+          await Notification.create({
+            recipient: partnerId,
+            sender: socket.user._id,
+            type: 'new_message',
+            title: 'New Message',
+            message: `${verifiedName}: "${cleanText.substring(0, 60)}"`,
+            data: {
+              conversation_id: conversation._id.toString(),
+              message_id: directMessage._id.toString(),
+              actionUrl: `/messages?conversationId=${conversation._id}`
+            }
+          });
+        }
+
+        await directMessage.populate('sender_id', '_id name displayName avatar');
         const formatted = formatDirectMessage(directMessage);
 
-        // 1. Emit message_received to receiver user room and conversation room
+        // 1. Deliver message_received exactly ONCE to recipient's personal room
         io.to(`user:${partnerId.toString()}`).emit('message_received', formatted);
-        io.to(`conversation:${conversation._id.toString()}`).emit('message_received', formatted);
-        if (conversationId && conversationId.toString() !== conversation._id.toString()) {
-          io.to(`conversation:${conversationId.toString()}`).emit('message_received', formatted);
-        }
 
-        // 2. Emit message_sent to sender room & current socket
-        io.to(`user:${verifiedUserId}`).emit('message_sent', formatted);
-        socket.emit('message_sent', formatted);
+        // 2. Deliver message_sent to sender's other connected devices/tabs (excluding current socket)
+        socket.to(`user:${verifiedUserId}`).emit('message_sent', formatted);
 
-        // Legacy format for backward compatibility
-        const legacyPayload = {
-          connectionId: conversationId ? conversationId.toString() : conversation._id.toString(),
-          conversation_id: conversation._id.toString(),
-          message: {
-            _id: formatted.message_id,
-            sender: formatted.sender,
-            text: formatted.content,
-            createdAt: formatted.created_at,
-            isRead: false
-          }
-        };
-        io.to(`user:${partnerId.toString()}`).emit('message:received', legacyPayload);
-        io.to(`conversation:${conversation._id.toString()}`).emit('message:received', legacyPayload);
-        if (conversationId && conversationId.toString() !== conversation._id.toString()) {
-          io.to(`conversation:${conversationId.toString()}`).emit('message:received', legacyPayload);
-        }
-
+        // 3. Acknowledge delivery directly to the active sending socket
         if (typeof callback === 'function') {
           callback({ success: true, message: formatted });
         }

@@ -10,6 +10,12 @@ const COOKIE_OPTIONS = {
   maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
 };
 
+const CLEAR_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'lax'
+};
+
 /**
  * Calculate age accurately from date of birth
  */
@@ -91,7 +97,58 @@ const register = async (req, res, next) => {
       return errorResponse(res, 'An account with this email already exists.', 409);
     }
 
-    // 8. Create user with onboarding pending
+// Canonical Default 2D Avatars for Registration
+const DEFAULT_GIRL_AVATAR = {
+  gender: 'female',
+  skinTone: '#f8d7b8',
+  eyeColor: '#1e293b',
+  hairStyle: 'ponytails',
+  hairColor: '#e85d75',
+  mouthExpression: 'smile',
+  blush: true,
+  topStyle: 'crop-top',
+  topColor: '#ffffff',
+  bottomStyle: 'pleated-skirt',
+  bottomColor: '#f43f5e',
+  dressStyle: 'none',
+  dressColor: '#f43f5e',
+  shoesStyle: 'sneakers',
+  shoesColor: '#ffffff',
+  headwear: 'ribbon-clip',
+  headwearColor: '#f43f5e',
+  accessory: 'necklace',
+  accessoryColor: '#facc15',
+  specialItem: 'campus-pin'
+};
+
+const DEFAULT_BOY_AVATAR = {
+  gender: 'male',
+  skinTone: '#f8d7b8',
+  eyeColor: '#1e293b',
+  hairStyle: 'short-messy',
+  hairColor: '#111827',
+  mouthExpression: 'smirk',
+  blush: false,
+  topStyle: 'hoodie',
+  topColor: '#f43f5e',
+  bottomStyle: 'cargo-pants',
+  bottomColor: '#334155',
+  dressStyle: 'none',
+  dressColor: '#f43f5e',
+  shoesStyle: 'sneakers',
+  shoesColor: '#ffffff',
+  headwear: 'baseball-cap',
+  headwearColor: '#1e293b',
+  accessory: 'backpack',
+  accessoryColor: '#18181b',
+  specialItem: 'campus-pin'
+};
+
+    // 8. Create user with onboarding pending and default character avatar
+    const initialAvatar = sanitizedGender === 'female'
+      ? DEFAULT_GIRL_AVATAR
+      : (sanitizedGender === 'male' ? DEFAULT_BOY_AVATAR : DEFAULT_GIRL_AVATAR);
+
     const newUser = await User.create({
       name: chosenName,
       email: email.toLowerCase().trim(),
@@ -99,6 +156,7 @@ const register = async (req, res, next) => {
       dateOfBirth: new Date(dateOfBirth),
       gender: sanitizedGender,
       city: (city || '').trim(),
+      avatar: initialAvatar,
       relationshipIntent: sanitizedIntent,
       onlineStatus: ONLINE_STATUS.ONLINE,
       lastActive: new Date(),
@@ -217,7 +275,7 @@ const logout = async (req, res, next) => {
       });
     }
 
-    res.clearCookie('token', COOKIE_OPTIONS);
+    res.clearCookie('token', CLEAR_COOKIE_OPTIONS);
     return successResponse(res, null, 'Signed out of The Quad successfully.');
   } catch (error) {
     next(error);

@@ -49,6 +49,22 @@ const blockUser = async (req, res, next) => {
       { status: 'declined' }
     );
 
+    // Update Friendship to BLOCKED
+    try {
+      const Friendship = require('../models/Friendship');
+      await Friendship.updateMany(
+        {
+          $or: [
+            { requester: req.user._id, recipient: targetUserId },
+            { requester: targetUserId, recipient: req.user._id }
+          ]
+        },
+        { status: 'BLOCKED', actionUserId: req.user._id, blocked_at: new Date() }
+      );
+    } catch (fErr) {
+      console.warn('[Moderation] Friendship block sync warning:', fErr.message);
+    }
+
     // STRICT SECURITY: Immediately terminate voice session, close WebRTC, and clear co-seated context on block
     try {
       const { revokeVoiceSessionOnAuthLoss } = require('../socket/voiceHandler');
@@ -56,6 +72,8 @@ const blockUser = async (req, res, next) => {
       const io = req.app?.get('io') || getIO();
       if (io) {
         revokeVoiceSessionOnAuthLoss(req.user._id, targetUserId, io, 'blocked');
+        io.to(`user:${req.user._id.toString()}`).emit('user:blocked', { targetUserId: targetUserId.toString() });
+        io.to(`user:${targetUserId.toString()}`).emit('user:blocked', { targetUserId: req.user._id.toString() });
       }
     } catch (vErr) {
       console.warn('[Moderation] Error revoking voice session on block:', vErr.message);
@@ -65,7 +83,6 @@ const blockUser = async (req, res, next) => {
   } catch (error) {
     next(error);
   }
-
 };
 
 /**
@@ -210,11 +227,28 @@ const updateAdminReport = async (req, res, next) => {
   }
 };
 
+/**
+ * Get reports submitted by current user (Self-Service Report Tracking)
+ * GET /api/moderation/my-reports
+ */
+const getMyReports = async (req, res, next) => {
+  try {
+    const reports = await Report.find({ reporter: req.user._id })
+      .populate('reportedUser', 'name displayName avatar')
+      .sort({ createdAt: -1 });
+
+    return successResponse(res, { reports, count: reports.length }, 'User reports retrieved');
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   blockUser,
   unblockUser,
   getMyBlocks,
   submitReport,
+  getMyReports,
   getAdminReports,
   updateAdminReport
 };

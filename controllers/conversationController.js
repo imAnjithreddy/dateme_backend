@@ -24,24 +24,46 @@ const formatDirectMessage = (msg) => {
   const senderId = (doc.sender_id?._id || doc.sender_id || '').toString();
   const receiverId = (doc.receiver_id?._id || doc.receiver_id || '').toString();
 
-  const formatted = {
-    message_id: messageId,
-    conversation_id: conversationId,
-    sender_id: senderId,
-    receiver_id: receiverId,
-    content: doc.content || '',
-    created_at: doc.created_at || doc.createdAt,
-    updated_at: doc.updated_at || doc.updatedAt,
-    read_at: doc.read_at || null
-  };
+  const content = doc.content || doc.text || '';
+  const timestamp = doc.created_at || doc.createdAt || new Date().toISOString();
 
+  let senderObj = null;
   if (doc.sender_id && typeof doc.sender_id === 'object' && doc.sender_id.name) {
-    formatted.sender = {
+    senderObj = {
       _id: doc.sender_id._id,
       name: doc.sender_id.name,
+      displayName: doc.sender_id.displayName || doc.sender_id.name,
       avatar: doc.sender_id.avatar
     };
+  } else if (doc.sender && typeof doc.sender === 'object' && doc.sender.name) {
+    senderObj = {
+      _id: doc.sender._id,
+      name: doc.sender.name,
+      displayName: doc.sender.displayName || doc.sender.name,
+      avatar: doc.sender.avatar
+    };
+  } else if (senderId) {
+    senderObj = {
+      _id: senderId
+    };
   }
+
+  const formatted = {
+    _id: messageId,
+    message_id: messageId,
+    conversation_id: conversationId,
+    connectionId: conversationId,
+    sender_id: senderId,
+    sender: senderObj,
+    receiver_id: receiverId,
+    content: content,
+    text: content,
+    created_at: timestamp,
+    createdAt: timestamp,
+    updated_at: doc.updated_at || doc.updatedAt || timestamp,
+    read_at: doc.read_at || null,
+    isRead: Boolean(doc.read_at)
+  };
 
   return formatted;
 };
@@ -77,7 +99,7 @@ const verifyCommunicationEligibility = async (senderUser, targetUserOrId) => {
   }
 
   // 5. Account communication permissions
-  if (senderUser.isBanned || senderUser.isSuspended || senderUser.isBlocked) {
+  if (senderUser.isBanned || senderUser.isSuspended || senderUser.isBlocked || (senderUser.restrictions && senderUser.restrictions.canChat === false)) {
     return {
       eligible: false,
       statusCode: 403,
@@ -677,35 +699,20 @@ const sendMessage = async (req, res, next) => {
     });
 
     // Populate sender info for return response
-    await directMessage.populate('sender_id', '_id name avatar');
+    await directMessage.populate('sender_id', '_id name displayName avatar');
 
     const formatted = formatDirectMessage(directMessage);
 
     // 8. Real-time WebSocket broadcasting:
-    // Player B receives message instantly without refreshing; sender receives message_sent confirmation
+    // Deliver message_received exactly ONCE to recipient's personal room; deliver message_sent to sender
     const { getIO } = require('../socket');
     const io = req.app?.get('io') || getIO();
     if (io) {
-      // 1. Deliver message_received to receiver user room and conversation channel
+      // 1. Deliver message_received to receiver user room
       io.to(`user:${receiver_id.toString()}`).emit('message_received', formatted);
-      io.to(`conversation:${conversation._id.toString()}`).emit('message_received', formatted);
 
-      // 2. Deliver message_sent to sender
+      // 2. Deliver message_sent to sender's other connected sessions
       io.to(`user:${sender_id.toString()}`).emit('message_sent', formatted);
-
-      // Legacy format for backward compatibility
-      const legacyPayload = {
-        connectionId: conversation._id.toString(),
-        message: {
-          _id: formatted.message_id,
-          sender: formatted.sender,
-          text: formatted.content,
-          createdAt: formatted.created_at,
-          isRead: false
-        }
-      };
-      io.to(`user:${receiver_id.toString()}`).emit('message:received', legacyPayload);
-      io.to(`conversation:${conversation._id.toString()}`).emit('message:received', legacyPayload);
     }
 
     return successResponse(res, formatted, 'Message sent successfully.', 201);
@@ -824,12 +831,74 @@ const deleteConversation = async (req, res, next) => {
   }
 };
 
+/**
+ * Mute conversation notifications
+ * POST /api/conversations/:id/mute
+ */
+const muteConversation = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { durationHours = null } = req.body;
+    const userId = req.user._id;
+
+    const conversation = await Conversation.findById(id);
+    if (!conversation) {
+      return errorResponse(res, 'Conversation not found.', 404);
+    }
+
+    const isMember = conversation.participants.some(
+      (p) => (p._id || p).toString() === userId.toString()
+    );
+    if (!isMember) {
+      return errorResponse(res, 'Not authorized.', 403);
+    }
+
+    const mutedUntil = durationHours ? new Date(Date.now() + durationHours * 60 * 60 * 1000) : null;
+    conversation.mutedBy = (conversation.mutedBy || []).filter(
+      (m) => m.user.toString() !== userId.toString()
+    );
+    conversation.mutedBy.push({ user: userId, mutedUntil });
+    await conversation.save();
+
+    return successResponse(res, { mutedUntil }, 'Conversation muted.');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Unmute conversation notifications
+ * POST /api/conversations/:id/unmute
+ */
+const unmuteConversation = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user._id;
+
+    const conversation = await Conversation.findById(id);
+    if (!conversation) {
+      return errorResponse(res, 'Conversation not found.', 404);
+    }
+
+    conversation.mutedBy = (conversation.mutedBy || []).filter(
+      (m) => m.user.toString() !== userId.toString()
+    );
+    await conversation.save();
+
+    return successResponse(res, null, 'Conversation unmuted.');
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   getConversations,
   getMessages,
   sendMessage,
   getOrCreateWithUser,
   deleteConversation,
+  muteConversation,
+  unmuteConversation,
   verifyCommunicationEligibility,
   formatDirectMessage
 };

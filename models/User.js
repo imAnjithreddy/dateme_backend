@@ -208,6 +208,10 @@ const userSchema = new mongoose.Schema(
       type: Boolean,
       default: false
     },
+    suspendedUntil: {
+      type: Date,
+      default: null
+    },
     suspendReason: {
       type: String,
       default: ''
@@ -220,6 +224,31 @@ const userSchema = new mongoose.Schema(
       type: String,
       default: ''
     },
+    restrictions: {
+      canChat: {
+        type: Boolean,
+        default: true
+      },
+      canSendRequests: {
+        type: Boolean,
+        default: true
+      },
+      canUseVoice: {
+        type: Boolean,
+        default: true
+      }
+    },
+    warningCount: {
+      type: Number,
+      default: 0
+    },
+    warnings: [
+      {
+        reason: { type: String, required: true },
+        issuedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        issuedAt: { type: Date, default: Date.now }
+      }
+    ],
     role: {
       type: String,
       enum: [ROLES.USER, ROLES.PLATFORM_ADMIN],

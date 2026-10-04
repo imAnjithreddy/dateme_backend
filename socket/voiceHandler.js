@@ -161,7 +161,7 @@ const attachVoiceHandlers = (socket, io, userSockets, players = null) => {
       }
 
       // Check caller account restrictions
-      if (socket.user.isBanned || socket.user.isSuspended || socket.user.isBlocked) {
+      if (socket.user.isBanned || socket.user.isSuspended || socket.user.isBlocked || (socket.user.restrictions && socket.user.restrictions.canUseVoice === false)) {
         const err = { success: false, error: 'Your account is restricted from voice communication.' };
         if (typeof callback === 'function') return callback(err);
         return socket.emit('voice:error', err);
@@ -169,7 +169,7 @@ const attachVoiceHandlers = (socket, io, userSockets, players = null) => {
 
       // Lookup target friend
       const targetUser = await User.findById(targetUserId).select(
-        'name displayName avatar isBanned isSuspended isBlocked onlineStatus'
+        'name displayName avatar isBanned isSuspended isBlocked onlineStatus restrictions'
       );
 
       if (!targetUser) {
@@ -178,7 +178,7 @@ const attachVoiceHandlers = (socket, io, userSockets, players = null) => {
         return socket.emit('voice:error', err);
       }
 
-      if (targetUser.isBanned || targetUser.isSuspended || targetUser.isBlocked) {
+      if (targetUser.isBanned || targetUser.isSuspended || targetUser.isBlocked || (targetUser.restrictions && targetUser.restrictions.canUseVoice === false)) {
         const err = { success: false, error: 'Target student is unavailable or restricted.' };
         if (typeof callback === 'function') return callback(err);
         return socket.emit('voice:error', err);

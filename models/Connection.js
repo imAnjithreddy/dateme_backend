@@ -28,6 +28,14 @@ const connectionSchema = new mongoose.Schema(
     campusZone: {
       type: String,
       default: 'central-quad'
+    },
+    declinedAt: {
+      type: Date,
+      default: null
+    },
+    cooldownUntil: {
+      type: Date,
+      default: null
     }
   },
   {

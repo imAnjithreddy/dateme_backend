@@ -7,6 +7,7 @@ router.use(authenticateUser);
 
 router.get('/', connectionController.getConnections);
 router.get('/pending', connectionController.getPendingRequests);
+router.get('/sent', connectionController.getSentRequests);
 router.post('/request', connectionController.sendRequest);
 router.post('/respond', connectionController.respondRequest);
 router.put('/:connectionId/respond', connectionController.respondRequest);

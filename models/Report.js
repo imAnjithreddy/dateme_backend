@@ -39,14 +39,27 @@ const reportSchema = new mongoose.Schema(
       default: ''
     },
     messageContext: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Message'
+      type: mongoose.Schema.Types.Mixed,
+      default: null
+    },
+    messageSnippet: {
+      type: String,
+      default: ''
+    },
+    campusZoneContext: {
+      type: String,
+      default: 'central-quad'
     },
     status: {
       type: String,
       enum: ['pending', 'investigating', 'reviewed', 'resolved', 'dismissed', 'action_taken'],
       default: 'pending',
       index: true
+    },
+    actionTaken: {
+      type: String,
+      enum: ['none', 'warning', 'silence', 'suspend', 'ban', 'content_removed', 'dismissed'],
+      default: 'none'
     },
     adminNotes: {
       type: String,

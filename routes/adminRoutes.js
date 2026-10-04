@@ -16,6 +16,7 @@ router.get('/overview', adminController.getOverviewStats);
 // 2. Users Management
 router.get('/users', adminController.getUsers);
 router.get('/users/:id', adminController.getUserDetails);
+router.get('/users/:id/moderation-history', adminController.getUserModerationHistory);
 router.post('/users/:id/suspend', adminController.suspendUser);
 router.post('/users/:id/unsuspend', adminController.unsuspendUser);
 router.post('/users/:id/ban', adminController.banUser);

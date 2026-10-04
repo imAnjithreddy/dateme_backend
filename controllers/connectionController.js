@@ -38,6 +38,21 @@ const sendRequest = async (req, res, next) => {
       return errorResponse(res, 'Target campus member not found or unavailable.', 404);
     }
 
+    // Check account restrictions
+    if (req.user.restrictions && req.user.restrictions.canSendRequests === false) {
+      return errorResponse(res, 'Your account is restricted from sending connection requests.', 403);
+    }
+
+    // Enforce 25 connection requests per 24 hours anti-spam limit
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const sentCount = await Connection.countDocuments({
+      requester: req.user._id,
+      createdAt: { $gte: oneDayAgo }
+    });
+    if (sentCount >= 25) {
+      return errorResponse(res, 'Daily connection request limit reached (25/day). Please try again tomorrow to maintain campus safety.', 429);
+    }
+
     // Check existing connection in either direction
     let connection = await Connection.findOne({
       $or: [
@@ -50,10 +65,23 @@ const sendRequest = async (req, res, next) => {
       if (connection.status === 'accepted') {
         return successResponse(res, { connection }, 'You are already connected with this student.', 200);
       }
+
+      // Enforce 7-Day cooldown if the request was declined
+      if (connection.status === 'declined' && connection.declinedAt) {
+        const cooldownMs = 7 * 24 * 60 * 60 * 1000;
+        const elapsed = Date.now() - new Date(connection.declinedAt).getTime();
+        if (elapsed < cooldownMs) {
+          const daysLeft = Math.ceil((cooldownMs - elapsed) / (24 * 60 * 60 * 1000));
+          return errorResponse(res, `Connection request was not accepted. You can try again in ${daysLeft} day${daysLeft > 1 ? 's' : ''}.`, 400);
+        }
+      }
+
       if (connection.status === 'pending') {
         // If the other user already sent a request to me, auto-accept it to form a match!
         if (connection.requester.toString() === finalRecipientId) {
           connection.status = 'accepted';
+          connection.declinedAt = null;
+          connection.cooldownUntil = null;
           await connection.save();
 
           // Create / activate MATCH
@@ -72,13 +100,20 @@ const sendRequest = async (req, res, next) => {
             await match.save();
           }
 
+          // Clean up pending notifications
+          await Notification.deleteMany({
+            recipient: req.user._id,
+            sender: finalRecipientId,
+            type: { $in: ['connection_request', 'friend_request'] }
+          });
+
           // Notify the other user that mutual connection & match formed
           await Notification.create({
             recipient: finalRecipientId,
             sender: req.user._id,
             type: 'connection_accepted',
-            title: 'Mutual Match Sparked! 💕',
-            message: `${req.user.name} and you are now matched! Start a conversation in Whispers.`,
+            title: 'Connection Accepted! 💕',
+            message: `${req.user.name} accepted your connection request. You are now campus friends and can chat!`,
             data: { connectionId: connection._id, matchId: match._id, actionUrl: '/messages' }
           });
 
@@ -87,12 +122,14 @@ const sendRequest = async (req, res, next) => {
         return errorResponse(res, 'A connection request is already pending.', 400);
       }
 
-      // Re-activate if was passed, declined, or cancelled
+      // Re-activate if was passed, declined (after cooldown), or cancelled
       connection.status = 'pending';
       connection.requester = req.user._id;
       connection.recipient = finalRecipientId;
       connection.connectionOrigin = connectionOrigin;
       connection.campusZone = campusZone;
+      connection.declinedAt = null;
+      connection.cooldownUntil = null;
       await connection.save();
     } else {
       connection = await Connection.create({
@@ -104,13 +141,20 @@ const sendRequest = async (req, res, next) => {
       });
     }
 
+    // Clean up any old notifications between this pair
+    await Notification.deleteMany({
+      recipient: finalRecipientId,
+      sender: req.user._id,
+      type: { $in: ['connection_request', 'friend_request'] }
+    });
+
     // Create notification for recipient
     await Notification.create({
       recipient: finalRecipientId,
       sender: req.user._id,
       type: 'connection_request',
-      title: 'New Connection Request',
-      message: `${req.user.name} wants to connect with you.`,
+      title: 'Campus Connection Request',
+      message: `${req.user.name} wants to connect with you!`,
       data: {
         connectionId: connection._id,
         actionUrl: '/notifications'
@@ -210,6 +254,8 @@ const respondRequest = async (req, res, next) => {
 
     if (action === 'accept') {
       connection.status = 'accepted';
+      connection.declinedAt = null;
+      connection.cooldownUntil = null;
       await connection.save();
 
       // Create / activate MATCH
@@ -228,13 +274,20 @@ const respondRequest = async (req, res, next) => {
         await match.save();
       }
 
-      // Create notification for requester
+      // Clean up related pending notifications
+      await Notification.deleteMany({
+        recipient: req.user._id,
+        sender: connection.requester._id,
+        type: { $in: ['connection_request', 'friend_request'] }
+      });
+
+      // Create canonical notification for requester
       await Notification.create({
         recipient: connection.requester._id,
         sender: req.user._id,
         type: 'connection_accepted',
-        title: 'Connection Accepted! 🎉',
-        message: `${req.user.name} accepted your connection request! Start a conversation in Whispers.`,
+        title: 'Connection Accepted! 💕',
+        message: `${req.user.name} accepted your connection request. You are now campus friends and can chat!`,
         data: {
           connectionId: connection._id,
           matchId: match._id,
@@ -298,7 +351,16 @@ const respondRequest = async (req, res, next) => {
       );
     } else {
       connection.status = 'declined';
+      connection.declinedAt = new Date();
+      connection.cooldownUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
       await connection.save();
+
+      // Clean up related pending notifications
+      await Notification.deleteMany({
+        recipient: req.user._id,
+        sender: connection.requester._id,
+        type: { $in: ['connection_request', 'friend_request'] }
+      });
 
       // Bidirectional Sync: Also update Friendship to DECLINED
       try {
@@ -327,7 +389,8 @@ const respondRequest = async (req, res, next) => {
             partnerId: req.user._id.toString(),
             targetUserId: connection.requester._id.toString(),
             status: 'DECLINED',
-            isFriend: false
+            isFriend: false,
+            cooldownUntil: connection.cooldownUntil
           };
           io.to(`user:${connection.requester._id.toString()}`).emit('friendship:status_changed', payload);
           io.to(`user:${connection.requester._id.toString()}`).emit('friend:declined', payload);
@@ -514,13 +577,57 @@ const passUser = async (req, res, next) => {
       return errorResponse(res, 'Target user ID is required.', 400);
     }
 
-    await Connection.findOneAndUpdate(
-      { requester: req.user._id, recipient: targetUserId },
-      { requester: req.user._id, recipient: targetUserId, status: 'passed' },
-      { upsert: true, new: true }
-    );
+    const existing = await Connection.findOne({
+      $or: [
+        { requester: req.user._id, recipient: targetUserId },
+        { requester: targetUserId, recipient: req.user._id }
+      ]
+    });
+
+    if (existing) {
+      if (existing.status !== 'accepted') {
+        existing.status = 'passed';
+        existing.requester = req.user._id;
+        existing.recipient = targetUserId;
+        await existing.save();
+      }
+    } else {
+      await Connection.create({
+        requester: req.user._id,
+        recipient: targetUserId,
+        status: 'passed',
+        connectionOrigin: 'discovery_feed'
+      });
+    }
 
     return successResponse(res, null, 'User passed.');
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get active pending requests sent by the current user (Sent History)
+ * GET /api/connections/sent
+ */
+const getSentRequests = async (req, res, next) => {
+  try {
+    const blocks = await Block.find({
+      $or: [{ blocker: req.user._id }, { blocked: req.user._id }]
+    });
+    const blockedIds = blocks.map((b) =>
+      b.blocker.toString() === req.user._id.toString() ? b.blocked.toString() : b.blocker.toString()
+    );
+
+    const requests = await Connection.find({
+      requester: req.user._id,
+      status: 'pending',
+      recipient: { $nin: blockedIds }
+    })
+      .populate('recipient', 'name email age city bio avatar interests hobbies relationshipIntent faculty education level')
+      .sort({ createdAt: -1 });
+
+    return successResponse(res, { requests, count: requests.length }, 'Sent requests retrieved');
   } catch (error) {
     next(error);
   }
@@ -533,5 +640,6 @@ module.exports = {
   removeConnection,
   getConnections,
   getPendingRequests,
+  getSentRequests,
   passUser
 };

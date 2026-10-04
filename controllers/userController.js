@@ -20,12 +20,19 @@ const completeOnboarding = async (req, res, next) => {
       languages,
       education,
       occupation,
-      discoveryPreferences
+      discoveryPreferences,
+      avatar,
+      gender
     } = req.body;
 
     const updates = {
       onboardingCompleted: true
     };
+
+    if (avatar && typeof avatar === 'object') updates.avatar = avatar;
+    if (gender && ['male', 'female', 'non-binary', 'prefer_not_to_say'].includes(gender)) {
+      updates.gender = gender;
+    }
 
     if (profilePhoto !== undefined) updates.profilePhoto = profilePhoto;
     if (bio !== undefined) updates.bio = String(bio).trim().substring(0, 500);
@@ -104,6 +111,11 @@ const updateProfile = async (req, res, next) => {
           updates.avatar = {
             ...(req.user.avatar || {}),
             ...req.body.avatar
+          };
+        } else if (field === 'privacySettings' && typeof req.body.privacySettings === 'object') {
+          updates.privacySettings = {
+            ...(req.user.privacySettings || {}),
+            ...req.body.privacySettings
           };
         } else {
           updates[field] = req.body[field];

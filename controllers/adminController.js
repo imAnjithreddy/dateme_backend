@@ -486,12 +486,49 @@ const takeModerationAction = async (req, res, next) => {
     let resultMessage = '';
 
     switch (actionType) {
-      case 'suspend':
-        targetUser.isSuspended = true;
-        targetUser.suspendReason = reason || 'Suspended by admin moderation';
+      case 'warn': {
+        targetUser.warningCount = (targetUser.warningCount || 0) + 1;
+        targetUser.warnings = targetUser.warnings || [];
+        targetUser.warnings.push({
+          reason: reason || 'Community guidelines violation warning',
+          issuedBy: req.user._id,
+          issuedAt: new Date()
+        });
         await targetUser.save();
-        resultMessage = `User ${targetUser.name} suspended.`;
+
+        await Notification.create({
+          recipient: targetUser._id,
+          sender: null,
+          type: 'system',
+          title: '⚠️ Safety Warning',
+          message: `Official Notice: You have received a community warning. Reason: ${reason || 'Please adhere to campus guidelines.'}`
+        });
+
+        resultMessage = `Warning issued to ${targetUser.name}. Strike count: ${targetUser.warningCount}.`;
         break;
+      }
+
+      case 'restrict': {
+        const newRestrictions = req.body.restrictions || {};
+        targetUser.restrictions = {
+          canChat: newRestrictions.canChat !== undefined ? Boolean(newRestrictions.canChat) : (targetUser.restrictions?.canChat ?? true),
+          canSendRequests: newRestrictions.canSendRequests !== undefined ? Boolean(newRestrictions.canSendRequests) : (targetUser.restrictions?.canSendRequests ?? true),
+          canUseVoice: newRestrictions.canUseVoice !== undefined ? Boolean(newRestrictions.canUseVoice) : (targetUser.restrictions?.canUseVoice ?? true)
+        };
+        await targetUser.save();
+        resultMessage = `Feature restrictions updated for ${targetUser.name}.`;
+        break;
+      }
+
+      case 'suspend': {
+        const durationHours = Number(req.body.durationHours) || null;
+        targetUser.isSuspended = true;
+        targetUser.suspendedUntil = durationHours ? new Date(Date.now() + durationHours * 60 * 60 * 1000) : null;
+        targetUser.suspendReason = reason || `Suspended by admin moderation${durationHours ? ` for ${durationHours}h` : ''}`;
+        await targetUser.save();
+        resultMessage = `User ${targetUser.name} suspended${durationHours ? ` for ${durationHours} hours` : ' indefinitely'}.`;
+        break;
+      }
 
       case 'ban':
         targetUser.isBanned = true;
@@ -1077,12 +1114,55 @@ const updatePlatformSettings = async (req, res, next) => {
   }
 };
 
+/**
+ * Get user moderation & abuse history (reports filed against & by user, warnings, sanctions)
+ * GET /api/admin/users/:id/moderation-history
+ */
+const getUserModerationHistory = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const user = await User.findById(id).select(
+      'name email role warningCount warnings restrictions isSuspended suspendedUntil suspendReason isBanned banReason createdAt'
+    );
+    if (!user) {
+      return errorResponse(res, 'User not found.', 404);
+    }
+
+    const [reportsAgainst, reportsFiled] = await Promise.all([
+      Report.find({ reportedUser: id }).populate('reporter', 'name email').sort({ createdAt: -1 }),
+      Report.find({ reporter: id }).populate('reportedUser', 'name email').sort({ createdAt: -1 })
+    ]);
+
+    return successResponse(
+      res,
+      {
+        user,
+        reportsAgainst,
+        reportsFiled,
+        warnings: user.warnings || [],
+        sanctions: {
+          isSuspended: user.isSuspended,
+          suspendedUntil: user.suspendedUntil,
+          suspendReason: user.suspendReason,
+          isBanned: user.isBanned,
+          banReason: user.banReason,
+          restrictions: user.restrictions || {}
+        }
+      },
+      'User moderation history retrieved'
+    );
+  } catch (error) {
+    next(error);
+  }
+};
+
 module.exports = {
   // 1. Overview
   getOverviewStats,
   // 2. Users
   getUsers,
   getUserDetails,
+  getUserModerationHistory,
   suspendUser,
   unsuspendUser,
   banUser,

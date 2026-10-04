@@ -31,7 +31,13 @@ const conversationSchema = new mongoose.Schema(
     lastMessageAt: {
       type: Date,
       default: Date.now
-    }
+    },
+    mutedBy: [
+      {
+        user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        mutedUntil: { type: Date, default: null }
+      }
+    ]
   },
   {
     timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' },

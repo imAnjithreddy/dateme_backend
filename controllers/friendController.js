@@ -118,6 +118,21 @@ const sendFriendRequest = async (req, res, next) => {
       return errorResponse(res, 'Cannot send a friend request to this user.', 403);
     }
 
+    // Check account restrictions
+    if (req.user.restrictions && req.user.restrictions.canSendRequests === false) {
+      return errorResponse(res, 'Your account is restricted from sending friend requests.', 403);
+    }
+
+    // Enforce 25 friend requests per 24 hours anti-spam limit
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const sentCount = await Friendship.countDocuments({
+      requester: requesterId,
+      created_at: { $gte: oneDayAgo }
+    });
+    if (sentCount >= 25) {
+      return errorResponse(res, 'Daily friend request limit reached (25/day). Please try again tomorrow to maintain campus safety.', 429);
+    }
+
     // Rule: Prevent duplicate friendships
     const existingAccepted = await Friendship.findOne({
       status: 'ACCEPTED',
@@ -128,6 +143,21 @@ const sendFriendRequest = async (req, res, next) => {
     });
     if (existingAccepted) {
       return errorResponse(res, 'You are already friends with this user.', 400);
+    }
+
+    // Check 7-Day cooldown if previously declined
+    const existingDeclined = await Friendship.findOne({
+      status: 'DECLINED',
+      requester: requesterId,
+      recipient: recipientId
+    });
+    if (existingDeclined && existingDeclined.declined_at) {
+      const cooldownMs = 7 * 24 * 60 * 60 * 1000;
+      const elapsed = Date.now() - new Date(existingDeclined.declined_at).getTime();
+      if (elapsed < cooldownMs) {
+        const daysLeft = Math.ceil((cooldownMs - elapsed) / (24 * 60 * 60 * 1000));
+        return errorResponse(res, `Friend request was not accepted. You can try again in ${daysLeft} day${daysLeft > 1 ? 's' : ''}.`, 400);
+      }
     }
 
     // Rule: Prevent duplicate pending requests
@@ -320,16 +350,23 @@ const acceptFriendRequest = async (req, res, next) => {
       console.warn('[Friendship] Connection sync warning:', e.message);
     }
 
+    // Clean up related pending notifications
+    await Notification.deleteMany({
+      recipient: userId,
+      sender: request.requester,
+      type: { $in: ['friend_request', 'connection_request'] }
+    });
+
     // Notify requester
     await Notification.create({
       recipient: request.requester,
       sender: userId,
-      type: 'friend_accepted',
-      title: 'Friend Request Accepted',
-      message: `${req.user.name} accepted your friend request! You are now friends.`,
+      type: 'connection_accepted',
+      title: 'Friend Request Accepted! 💕',
+      message: `${req.user.name} accepted your friend request. You are now campus friends and can chat!`,
       data: {
         friendshipId: request._id,
-        actionUrl: '/friends'
+        actionUrl: '/messages'
       }
     });
 
@@ -400,7 +437,14 @@ const declineFriendRequest = async (req, res, next) => {
     request.declined_at = new Date();
     await request.save();
 
-    // Bidirectional Sync: Also set Connection status to declined
+    // Clean up related pending notifications
+    await Notification.deleteMany({
+      recipient: userId,
+      sender: request.requester,
+      type: { $in: ['friend_request', 'connection_request'] }
+    });
+
+    // Bidirectional Sync: Also set Connection status to declined with 7-day cooldown
     try {
       const Connection = require('../models/Connection');
       await Connection.updateMany(
@@ -411,7 +455,11 @@ const declineFriendRequest = async (req, res, next) => {
           ],
           status: 'pending'
         },
-        { status: 'declined' }
+        {
+          status: 'declined',
+          declinedAt: new Date(),
+          cooldownUntil: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+        }
       );
     } catch (cErr) {
       console.warn('[Friendship] Connection decline sync warning:', cErr.message);

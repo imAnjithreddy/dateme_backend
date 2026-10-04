@@ -233,15 +233,30 @@ const sendMessage = async (req, res, next) => {
       const { getIO } = require('../socket');
       const io = req.app?.get('io') || getIO();
       if (io) {
+        const formattedMsg = {
+          _id: populated._id.toString(),
+          message_id: populated._id.toString(),
+          connectionId: connection._id.toString(),
+          conversation_id: connection._id.toString(),
+          sender_id: populated.sender?._id?.toString() || req.user._id.toString(),
+          sender: populated.sender,
+          receiver_id: recipientId.toString(),
+          content: populated.text,
+          text: populated.text,
+          created_at: populated.createdAt,
+          createdAt: populated.createdAt,
+          isRead: false
+        };
+
         const payload = {
           connectionId: connection._id.toString(),
           conversation_id: connection._id.toString(),
-          message: populated
+          message: populated,
+          ...formattedMsg
         };
-        io.to(`user:${recipientId.toString()}`).emit('message:received', payload);
+
         io.to(`user:${recipientId.toString()}`).emit('message_received', payload);
-        io.to(`conversation:${connection._id.toString()}`).emit('message:received', payload);
-        io.to(`conversation:${connection._id.toString()}`).emit('message_received', payload);
+        io.to(`user:${req.user._id.toString()}`).emit('message_sent', payload);
       }
     } catch (sockErr) {
       console.warn('[messageController] Socket broadcast warning:', sockErr.message);
