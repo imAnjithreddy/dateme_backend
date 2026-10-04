@@ -3,6 +3,7 @@ const Friendship = require('../models/Friendship');
 const User = require('../models/User');
 const Block = require('../models/Block');
 const Notification = require('../models/Notification');
+const notificationService = require('../services/notificationService');
 const { successResponse, errorResponse } = require('../utils/apiResponse');
 
 // Safe user fields projection to prevent credential leakage
@@ -207,7 +208,7 @@ const sendFriendRequest = async (req, res, next) => {
     }
 
     // Create persistent notification for the recipient
-    await Notification.create({
+    await notificationService.createAndEmitNotification({
       recipient: recipientId,
       sender: requesterId,
       type: 'friend_request',
@@ -358,7 +359,7 @@ const acceptFriendRequest = async (req, res, next) => {
     });
 
     // Notify requester
-    await Notification.create({
+    await notificationService.createAndEmitNotification({
       recipient: request.requester,
       sender: userId,
       type: 'connection_accepted',

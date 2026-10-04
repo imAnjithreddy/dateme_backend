@@ -7,6 +7,7 @@ const Message = require('../models/Message');
 const User = require('../models/User');
 const Block = require('../models/Block');
 const Notification = require('../models/Notification');
+const notificationService = require('../services/notificationService');
 const { successResponse, errorResponse } = require('../utils/apiResponse');
 
 // Standard user projection fields for conversation partners
@@ -756,7 +757,7 @@ const sendMessage = async (req, res, next) => {
     await conversation.save();
 
     // 7. Push in-app notification for recipient
-    await Notification.create({
+    await notificationService.createAndEmitNotification({
       recipient: receiver_id,
       sender: sender_id,
       type: 'new_message',
@@ -765,7 +766,7 @@ const sendMessage = async (req, res, next) => {
       data: {
         conversation_id: conversation._id.toString(),
         message_id: directMessage._id.toString(),
-        actionUrl: `/messages?conversationId=${conversation._id}`
+        actionUrl: '/messages'
       }
     });
 

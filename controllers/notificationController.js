@@ -1,4 +1,5 @@
 const Notification = require('../models/Notification');
+const notificationService = require('../services/notificationService');
 const { successResponse, errorResponse } = require('../utils/apiResponse');
 
 /**
@@ -16,10 +17,7 @@ const getNotifications = async (req, res, next) => {
       .sort({ createdAt: -1 })
       .limit(50);
 
-    const unreadCount = await Notification.countDocuments({
-      recipient: req.user._id,
-      isRead: false
-    });
+    const unreadCount = await notificationService.getUnreadCount(req.user._id);
 
     return successResponse(
       res,
@@ -42,20 +40,21 @@ const markAsRead = async (req, res, next) => {
   try {
     const { notificationId, markAll = false } = req.body;
 
-    if (markAll) {
-      await Notification.updateMany({ recipient: req.user._id }, { isRead: true });
-      return successResponse(res, null, 'All notifications marked as read.');
+    if (!markAll && !notificationId) {
+      return errorResponse(res, 'Notification ID or markAll flag required.', 400);
     }
 
-    if (notificationId) {
-      await Notification.findOneAndUpdate(
-        { _id: notificationId, recipient: req.user._id },
-        { isRead: true }
-      );
-      return successResponse(res, null, 'Notification marked as read.');
-    }
+    const { unreadCount } = await notificationService.markAndEmitRead({
+      userId: req.user._id,
+      notificationId,
+      markAll
+    });
 
-    return errorResponse(res, 'Notification ID or markAll flag required.', 400);
+    return successResponse(
+      res,
+      { unreadCount },
+      markAll ? 'All notifications marked as read.' : 'Notification marked as read.'
+    );
   } catch (error) {
     next(error);
   }

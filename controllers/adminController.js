@@ -7,6 +7,8 @@ const Match = require('../models/Match');
 const Message = require('../models/Message');
 const Connection = require('../models/Connection');
 const PlatformSetting = require('../models/PlatformSetting');
+const Notification = require('../models/Notification');
+const notificationService = require('../services/notificationService');
 const { getOnlineUsersCount, getOnlinePlayersList } = require('../socket');
 const { successResponse, errorResponse } = require('../utils/apiResponse');
 
@@ -496,12 +498,13 @@ const takeModerationAction = async (req, res, next) => {
         });
         await targetUser.save();
 
-        await Notification.create({
+        await notificationService.createAndEmitNotification({
           recipient: targetUser._id,
           sender: null,
           type: 'system',
           title: '⚠️ Safety Warning',
-          message: `Official Notice: You have received a community warning. Reason: ${reason || 'Please adhere to campus guidelines.'}`
+          message: `Official Notice: You have received a community warning. Reason: ${reason || 'Please adhere to campus guidelines.'}`,
+          data: { actionUrl: '/notifications' }
         });
 
         resultMessage = `Warning issued to ${targetUser.name}. Strike count: ${targetUser.warningCount}.`;

@@ -7,8 +7,14 @@ const Friendship = require('../models/Friendship');
 const Block = require('../models/Block');
 const Notification = require('../models/Notification');
 const Connection = require('../models/Connection');
-const { attachVoiceHandlers, handleVoiceDisconnect, endVoiceSessionOnSeatVacate } = require('./voiceHandler');
+const notificationService = require('../services/notificationService');
+const { attachVoiceHandlers, handleVoiceDisconnect, endVoiceSessionOnSeatVacate, removeUserFromRoomVoice } = require('./voiceHandler');
 const seatingManager = require('./seatingManager');
+const snapshotEngine = require('./snapshotEngine');
+const { attachTimeSyncHandlers } = require('./timeSync');
+const { LOBBY_SEATING_ZONES } = require('./DateeHomesLobbyCollision');
+const PrivateRoom = require('../models/PrivateRoom');
+const PrivateRoomMember = require('../models/PrivateRoomMember');
 
 // Valid Campus Area Rooms (includes all 2D zones, 3D zones, and chunk coordinates)
 const VALID_AREAS = [
@@ -26,11 +32,25 @@ const VALID_AREAS = [
   'serenity-park',
   'clocktower-residence',
   'residential-area',
+  'datee-homes-lobby',
   'sky-pier',
   'chunk_0_0', 'chunk_1_0', 'chunk_2_0',
   'chunk_0_1', 'chunk_1_1', 'chunk_2_1',
   'chunk_0_2', 'chunk_1_2', 'chunk_2_2'
 ];
+
+// Datee Homes Lobby Seating Occupancy Maps
+const lobbySeatOccupants = new Map(); // seatId -> { userId, socketId }
+const userLobbySeats = new Map();     // userId -> seatId
+
+// Datee Homes Private Room live occupants tracking: roomId -> Map(socketId, playerState)
+const privateRoomOccupants = new Map();
+const socketPrivateRooms = new Map(); // socketId -> roomId
+const privateRoomChatHistory = new Map(); // roomId -> Array of message objects
+
+// Rate Limit Tracking Maps (Chunk 7.5 Security)
+const chatRateLimits = new Map(); // userId -> { count, resetAt }
+const roomJoinRateLimits = new Map(); // userId -> { count, resetAt }
 
 // Map of socketId -> playerState
 const players = new Map();
@@ -216,6 +236,7 @@ const resolveConversation = async (conversationId, verifiedUserId) => {
 
 const initSocket = (io) => {
   ioInstance = io;
+  snapshotEngine.start(io);
 
   // Handshake authentication middleware: Strictly reject unauthenticated connections
   io.use(async (socket, next) => {
@@ -261,6 +282,9 @@ const initSocket = (io) => {
   });
 
   io.on('connection', (socket) => {
+    // Attach high-precision NTP-style server time sync handler
+    attachTimeSyncHandlers(socket);
+
     // Only authenticated users reach this handler
     const verifiedUserId = socket.user._id.toString();
     const verifiedName = socket.user.name || socket.user.displayName || 'Campus Student';
@@ -346,6 +370,14 @@ const initSocket = (io) => {
 
       players.set(socket.id, playerState);
 
+      // Register with authoritative snapshot engine
+      snapshotEngine.registerPlayer(socket.id, socket.user, {
+        x: posX,
+        y: posZ,
+        campusArea: initialArea,
+        direction: rotation
+      });
+
       // Join global campus room and initial area room
       socket.join('campus:world');
       socket.join(`area:${initialArea}`);
@@ -371,10 +403,10 @@ const initSocket = (io) => {
     });
 
     /**
-     * Event: player:move
-     * High-frequency movement synchronization with campus-wide broadcasting
+     * Event: player:move & player:move_input
+     * Authoritative movement validation & client input processing
      */
-    socket.on('player:move', (data) => {
+    const handlePlayerMove = (data = {}) => {
       const player = players.get(socket.id);
       if (!player) return;
 
@@ -387,9 +419,25 @@ const initSocket = (io) => {
         ? data.campusArea || data.zone
         : player.campusArea;
 
-      player.position = [newX, newY, newZ];
-      player.rotation = newRotation;
-      player.animationState = animationState;
+      // Authoritative validation via snapshot engine
+      const validated = snapshotEngine.processMovementInput(socket.id, {
+        x: newX,
+        y: newZ,
+        sequence: data.sequence,
+        direction: newRotation,
+        movementState: animationState,
+        campusArea: newArea
+      });
+
+      if (validated) {
+        player.position = [validated.x, 0, validated.y];
+        player.rotation = validated.direction;
+        player.animationState = validated.movementState;
+      } else {
+        player.position = [newX, newY, newZ];
+        player.rotation = newRotation;
+        player.animationState = animationState;
+      }
       player.lastActive = Date.now();
 
       // Check for area transition
@@ -397,6 +445,7 @@ const initSocket = (io) => {
         const oldArea = player.campusArea;
         player.campusArea = newArea;
         player.statusTag = `Exploring ${newArea.replace('-', ' ')}`;
+        snapshotEngine.setPlayerZone(socket.id, newArea);
 
         // Switch rooms
         socket.leave(`area:${oldArea}`);
@@ -421,7 +470,35 @@ const initSocket = (io) => {
         });
       }
 
-      // Broadcast position update to entire campus world so all players in range can render smoothly
+      // Check if player is inside an isolated private room
+      const activePrivateRoomId = socketPrivateRooms.get(socket.id) || (data.campusArea === 'private-room' ? data.roomId : null);
+      if (activePrivateRoomId) {
+        const roomMap = privateRoomOccupants.get(activePrivateRoomId.toString());
+        if (roomMap && roomMap.has(socket.id)) {
+          const rp = roomMap.get(socket.id);
+          rp.x = data.x;
+          rp.y = data.z !== undefined ? data.z : data.y;
+          rp.rotation = data.rotation;
+          rp.animationState = data.animationState;
+          rp.isMoving = data.isMoving;
+        }
+
+        // Broadcast movement ONLY to members inside room:${activePrivateRoomId}
+        socket.to(`room:${activePrivateRoomId.toString()}`).emit('private_room:peer_moved', {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          name: verifiedName,
+          x: data.x,
+          y: data.z !== undefined ? data.z : data.y,
+          rotation: data.rotation,
+          animationState: data.animationState,
+          isMoving: data.isMoving,
+          avatarConfig: socket.user?.avatar || data.avatar
+        });
+        return; // Strictly isolate private room movement from campus:world
+      }
+
+      // Backward-compatible legacy broadcast for any non-snapshot listeners
       socket.to('campus:world').emit('player:moved', {
         socketId: socket.id,
         userId: player.userId,
@@ -430,7 +507,11 @@ const initSocket = (io) => {
         animationState: player.animationState,
         campusArea: player.campusArea
       });
-    });
+    };
+
+    socket.on('player:move', handlePlayerMove);
+    socket.on('player_move', handlePlayerMove);
+    socket.on('player:move_input', handlePlayerMove);
 
     /**
      * Event: presence:status
@@ -466,6 +547,9 @@ const initSocket = (io) => {
         if (typeof data.y === 'number') player.position[2] = data.y;
         if (data.facing) player.rotation = data.facing;
       }
+
+      // Update authoritative snapshot engine
+      snapshotEngine.setPlayerSeated(socket.id, true, data.seatId, data.x, data.y, data.facing);
 
       // Authoritative server-side seating registration
       if (data.seatId) {
@@ -586,6 +670,9 @@ const initSocket = (io) => {
         if (typeof data.y === 'number') player.position[2] = data.y;
       }
 
+      // Update authoritative snapshot engine
+      snapshotEngine.setPlayerSeated(socket.id, false, null, data.x, data.y);
+
       // Player leaves seat -> Voice interaction context ends -> WebRTC connection closes
       endVoiceSessionOnSeatVacate(verifiedUserId, io, players);
 
@@ -612,6 +699,478 @@ const initSocket = (io) => {
         y: data.y
       });
     });
+
+    /**
+     * Datee Homes Lobby Seating Events (Chunk 0.6)
+     * Authoritative seat validation, occupancy broadcast, and state sync
+     */
+    socket.on('datee_homes:get_seats', () => {
+      const occupied = {};
+      for (const [seatId, rec] of lobbySeatOccupants) {
+        occupied[seatId] = rec.userId;
+      }
+      socket.emit('datee_homes:seats_state', { occupiedSeats: occupied });
+    });
+
+    socket.on('datee_homes:sit_request', (data = {}) => {
+      const { seatId } = data;
+      if (!seatId) return;
+
+      const seat = LOBBY_SEATING_ZONES.find((s) => s.seatId === seatId);
+      if (!seat) {
+        socket.emit('datee_homes:sit_rejected', { seatId, reason: 'Invalid seat' });
+        return;
+      }
+
+      const occupant = lobbySeatOccupants.get(seatId);
+      if (occupant && occupant.userId !== verifiedUserId) {
+        socket.emit('datee_homes:sit_rejected', { seatId, reason: 'Seat already occupied' });
+        return;
+      }
+
+      // Vacate user's previous seat if any
+      const prevSeatId = userLobbySeats.get(verifiedUserId);
+      if (prevSeatId && prevSeatId !== seatId) {
+        lobbySeatOccupants.delete(prevSeatId);
+        io.to('campus:world').emit('datee_homes:seat_vacated', {
+          seatId: prevSeatId,
+          userId: verifiedUserId
+        });
+      }
+
+      lobbySeatOccupants.set(seatId, { userId: verifiedUserId, socketId: socket.id });
+      userLobbySeats.set(verifiedUserId, seatId);
+
+      const player = players.get(socket.id);
+      if (player) {
+        player.isSeated = true;
+        player.seatId = seatId;
+        player.animationState = 'sit';
+        player.position[0] = seat.anchorX;
+        player.position[2] = seat.anchorY;
+        player.rotation = seat.facing;
+      }
+
+      snapshotEngine.setPlayerSeated(socket.id, true, seatId, seat.anchorX, seat.anchorY, seat.facing);
+
+      socket.emit('datee_homes:sit_approved', {
+        seatId,
+        anchorX: seat.anchorX,
+        anchorY: seat.anchorY,
+        facing: seat.facing
+      });
+
+      io.to('campus:world').emit('datee_homes:seat_occupied', {
+        seatId,
+        userId: verifiedUserId,
+        socketId: socket.id,
+        x: seat.anchorX,
+        y: seat.anchorY,
+        facing: seat.facing
+      });
+    });
+
+    socket.on('datee_homes:stand_request', () => {
+      const seatId = userLobbySeats.get(verifiedUserId);
+      const seat = seatId ? LOBBY_SEATING_ZONES.find((s) => s.seatId === seatId) : null;
+
+      if (seatId) {
+        lobbySeatOccupants.delete(seatId);
+        userLobbySeats.delete(verifiedUserId);
+      }
+
+      const player = players.get(socket.id);
+      if (player) {
+        player.isSeated = false;
+        player.seatId = null;
+        player.animationState = 'idle';
+        if (seat) {
+          player.position[0] = seat.standX;
+          player.position[2] = seat.standY;
+        }
+      }
+
+      snapshotEngine.setPlayerSeated(socket.id, false, null, seat?.standX, seat?.standY);
+
+      socket.emit('datee_homes:stand_approved', {
+        standX: seat?.standX,
+        standY: seat?.standY
+      });
+
+      io.to('campus:world').emit('datee_homes:seat_vacated', {
+        seatId,
+        userId: verifiedUserId,
+        socketId: socket.id,
+        standX: seat?.standX,
+        standY: seat?.standY
+      });
+    });
+
+    /**
+     * Datee Homes Private Room Multiplayer Events (Chunk 4)
+     * Authoritative access check, live presence, and isolated room movement channel
+     */
+    socket.on('private_room:join', async (data = {}, callback) => {
+      try {
+        const { roomId } = data;
+        if (!roomId) {
+          const err = { success: false, error: 'Room ID is required.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('private_room:error', err);
+        }
+
+        // 1. Rate limiting on room joins (max 5 per 3 seconds)
+        const now = Date.now();
+        let joinRate = roomJoinRateLimits.get(verifiedUserId);
+        if (!joinRate || now - joinRate.resetAt > 3000) {
+          joinRate = { count: 0, resetAt: now + 3000 };
+          roomJoinRateLimits.set(verifiedUserId, joinRate);
+        }
+        joinRate.count++;
+        if (joinRate.count > 5) {
+          const err = { success: false, error: 'You are joining rooms too rapidly. Please wait a moment.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('private_room:error', err);
+        }
+
+        let room = null;
+        if (mongoose.Types.ObjectId.isValid(roomId)) {
+          room = await PrivateRoom.findById(roomId);
+        } else {
+          // If roomCode was passed as roomId or non-ObjectId identifier
+          room = await PrivateRoom.findOne({ roomCode: String(roomId).toUpperCase() });
+        }
+
+        const isDemoOrLocal =
+          String(roomId).startsWith('room-demo-') ||
+          String(roomId).startsWith('room_');
+
+        if (!room) {
+          if (isDemoOrLocal) {
+            room = {
+              _id: roomId,
+              name: roomId === 'room-demo-1' ? 'Our Cozy Suite' : 'Campus Chai & Chill',
+              roomCode: roomId === 'room-demo-1' ? 'LOVE24' : 'HANG07',
+              type: roomId === 'room-demo-1' ? 'COUPLE' : 'FRIENDS',
+              maxPlayers: roomId === 'room-demo-1' ? 2 : 6,
+              ownerId: verifiedUserId,
+              status: 'ACTIVE'
+            };
+          } else {
+            const err = { success: false, error: 'Room not found or no longer active.' };
+            if (typeof callback === 'function') callback(err);
+            return socket.emit('private_room:error', err);
+          }
+        }
+
+        let membership = null;
+        if (mongoose.Types.ObjectId.isValid(room._id)) {
+          // Check block with owner
+          if (room.ownerId && mongoose.Types.ObjectId.isValid(room.ownerId)) {
+            const isBlocked = await Block.findOne({
+              $or: [
+                { blocker: verifiedUserId, blocked: room.ownerId },
+                { blocker: room.ownerId, blocked: verifiedUserId }
+              ]
+            });
+
+            if (isBlocked) {
+              const err = { success: false, error: 'Access to this room is restricted due to block settings.' };
+              if (typeof callback === 'function') callback(err);
+              return socket.emit('private_room:error', err);
+            }
+          }
+
+          // Authoritative membership check
+          membership = await PrivateRoomMember.findOne({
+            roomId: room._id,
+            userId: verifiedUserId
+          });
+
+          if (!membership && room.ownerId && room.ownerId.toString() !== verifiedUserId) {
+            const err = { success: false, error: 'You are not an authorized member of this private lounge.' };
+            if (typeof callback === 'function') callback(err);
+            return socket.emit('private_room:error', err);
+          }
+        }
+
+        const roomIdStr = (room._id || roomId).toString();
+
+        // 2. Strict capacity check: MAX 6 users for Friend Lounge per specification
+        if (!privateRoomOccupants.has(roomIdStr)) {
+          privateRoomOccupants.set(roomIdStr, new Map());
+        }
+        const roomMap = privateRoomOccupants.get(roomIdStr);
+        const maxCapacity = room.type === 'FRIENDS' ? 6 : 2;
+        if (!roomMap.has(socket.id) && roomMap.size >= maxCapacity) {
+          const err = {
+            success: false,
+            error: `No space available. This ${room.type === 'FRIENDS' ? 'lounge' : 'room'} is currently full (${maxCapacity} max).`
+          };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('private_room:error', err);
+        }
+
+        // 3. Block check against any existing room occupants
+        for (const occupant of roomMap.values()) {
+          if (occupant.userId && occupant.userId !== verifiedUserId) {
+            const hasBlock = await Block.findOne({
+              $or: [
+                { blocker: verifiedUserId, blocked: occupant.userId },
+                { blocker: occupant.userId, blocked: verifiedUserId }
+              ]
+            });
+            if (hasBlock) {
+              const err = { success: false, error: 'Access restricted due to block settings with an occupant.' };
+              if (typeof callback === 'function') callback(err);
+              return socket.emit('private_room:error', err);
+            }
+          }
+        }
+
+        // Leave any prior private room channel
+        const prevRoomId = socketPrivateRooms.get(socket.id);
+        if (prevRoomId && prevRoomId !== roomIdStr) {
+          socket.leave(`room:${prevRoomId}`);
+          socket.leave(`friend-lounge:${prevRoomId}`);
+          const prevMap = privateRoomOccupants.get(prevRoomId);
+          if (prevMap) {
+            prevMap.delete(socket.id);
+            socket.to(`room:${prevRoomId}`).emit('private_room:peer_left', {
+              socketId: socket.id,
+              userId: verifiedUserId
+            });
+            socket.to(`friend-lounge:${prevRoomId}`).emit('private_room:peer_left', {
+              socketId: socket.id,
+              userId: verifiedUserId
+            });
+          }
+          removeUserFromRoomVoice(prevRoomId, verifiedUserId, io);
+        }
+
+        // Join socket room channels (both standard and friend-lounge alias)
+        socket.join(`room:${roomIdStr}`);
+        socket.join(`friend-lounge:${roomIdStr}`);
+        socketPrivateRooms.set(socket.id, roomIdStr);
+
+        const playerState = {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          name: verifiedName,
+          role: membership?.role || 'MEMBER',
+          x: typeof data.x === 'number' ? data.x : 400,
+          y: typeof data.y === 'number' ? data.y : 420,
+          rotation: 'down',
+          animationState: 'idle',
+          isMoving: false,
+          avatarConfig: socket.user?.avatar || data.avatar || {}
+        };
+        roomMap.set(socket.id, playerState);
+
+        // Notify caller with current room occupants list
+        const occupantsList = Array.from(roomMap.values()).filter((p) => p.socketId !== socket.id);
+        socket.emit('private_room:joined', {
+          roomId: roomIdStr,
+          room: {
+            id: room._id,
+            roomCode: room.roomCode,
+            code: room.roomCode,
+            name: room.name,
+            type: room.type,
+            maxPlayers: maxCapacity,
+            theme: room.theme,
+            state: room.state
+          },
+          occupants: occupantsList
+        });
+
+        // Broadcast to other peers inside this room
+        socket.to(`room:${roomIdStr}`).emit('private_room:peer_joined', {
+          player: playerState
+        });
+        socket.to(`friend-lounge:${roomIdStr}`).emit('private_room:peer_joined', {
+          player: playerState
+        });
+
+        if (typeof callback === 'function') {
+          callback({ success: true, roomId: roomIdStr });
+        }
+      } catch (err) {
+        console.error('[Socket] private_room:join error:', err);
+        if (typeof callback === 'function') callback({ success: false, error: err.message });
+      }
+    });
+
+    socket.on('private_room:leave', ({ roomId } = {}) => {
+      const activeId = roomId ? roomId.toString() : socketPrivateRooms.get(socket.id);
+      if (activeId) {
+        socket.leave(`room:${activeId}`);
+        socket.leave(`friend-lounge:${activeId}`);
+        socketPrivateRooms.delete(socket.id);
+        const roomMap = privateRoomOccupants.get(activeId);
+        if (roomMap) {
+          roomMap.delete(socket.id);
+          socket.to(`room:${activeId}`).emit('private_room:peer_left', {
+            socketId: socket.id,
+            userId: verifiedUserId
+          });
+          socket.to(`friend-lounge:${activeId}`).emit('private_room:peer_left', {
+            socketId: socket.id,
+            userId: verifiedUserId
+          });
+        }
+        removeUserFromRoomVoice(activeId, verifiedUserId, io);
+      }
+    });
+
+    /**
+     * Private Room & Friend Lounge Group Chat (Chunk 7.5)
+     * Authoritative sender derivation, rate limiting, room occupancy verification, and isolated broadcast.
+     */
+    const handleSendRoomChat = async (data = {}, callback) => {
+      try {
+        if (!verifiedUserId) {
+          const err = { success: false, error: 'Authentication required to send chat messages.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('private_room:error', err);
+        }
+
+        // Rate limit: max 5 messages per 3 seconds
+        const now = Date.now();
+        let rate = chatRateLimits.get(verifiedUserId);
+        if (!rate || now - rate.resetAt > 3000) {
+          rate = { count: 0, resetAt: now + 3000 };
+          chatRateLimits.set(verifiedUserId, rate);
+        }
+        rate.count++;
+        if (rate.count > 5) {
+          const err = { success: false, error: 'You are sending messages too quickly. Please slow down.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('private_room:error', err);
+        }
+
+        const activeRoomId = data.roomId ? data.roomId.toString() : socketPrivateRooms.get(socket.id);
+        if (!activeRoomId) {
+          const err = { success: false, error: 'You are not inside this lounge.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('private_room:error', err);
+        }
+
+        // Authoritative membership/occupancy verification
+        const roomMap = privateRoomOccupants.get(activeRoomId);
+        if (!roomMap || !roomMap.has(socket.id)) {
+          const err = { success: false, error: 'You must be inside this lounge to send messages.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('private_room:error', err);
+        }
+
+        const text = String(data.text || '').trim();
+        if (!text) {
+          const err = { success: false, error: 'Message cannot be empty.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('private_room:error', err);
+        }
+
+        const cleanText = text.substring(0, 500);
+        const senderAvatar = socket.user?.avatar || data.avatar || {};
+        const senderName = socket.user?.name || verifiedName || 'Member';
+
+        // STRICT SECURITY: senderId is ALWAYS verifiedUserId, NEVER client-supplied data.senderId
+        const messageObj = {
+          id: `pmsg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+          roomId: activeRoomId,
+          senderId: verifiedUserId, // Authoritative identity
+          senderName: senderName,
+          senderAvatar: senderAvatar,
+          text: cleanText,
+          timestamp: new Date().toISOString()
+        };
+
+        if (!privateRoomChatHistory.has(activeRoomId)) {
+          privateRoomChatHistory.set(activeRoomId, []);
+        }
+        const history = privateRoomChatHistory.get(activeRoomId);
+        history.push(messageObj);
+        if (history.length > 50) {
+          history.shift();
+        }
+
+        // Broadcast ONLY to members inside room:${activeRoomId} and friend-lounge:${activeRoomId}
+        io.to(`room:${activeRoomId}`).emit('private_room:chat_message', messageObj);
+        io.to(`friend-lounge:${activeRoomId}`).emit('private_room:chat_message', messageObj);
+
+        // Also emit peer speech bubble for canvas overlay
+        io.to(`room:${activeRoomId}`).emit('private_room:peer_speech', {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          displayName: senderName,
+          text: cleanText,
+          timestamp: messageObj.timestamp
+        });
+
+        if (typeof callback === 'function') {
+          callback({ success: true, message: messageObj });
+        }
+      } catch (err) {
+        console.error('[Socket] private_room:send_chat error:', err);
+        if (typeof callback === 'function') callback({ success: false, error: err.message });
+      }
+    };
+
+    socket.on('private_room:send_chat', handleSendRoomChat);
+    socket.on('friend_lounge:send_chat', handleSendRoomChat);
+
+    const handleGetRoomChat = async ({ roomId } = {}, callback) => {
+      try {
+        const activeRoomId = roomId ? roomId.toString() : socketPrivateRooms.get(socket.id);
+        if (!activeRoomId) {
+          const err = { success: false, error: 'Room ID is required.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('private_room:error', err);
+        }
+
+        // STRICT SECURITY: Verify caller is an authorized member or active occupant before returning history
+        const roomMap = privateRoomOccupants.get(activeRoomId);
+        const isOccupant = roomMap && roomMap.has(socket.id);
+
+        let isAuthorized = isOccupant;
+        if (!isAuthorized) {
+          const isDemoOrLocal = activeRoomId.startsWith('room-demo-') || activeRoomId.startsWith('room_');
+          if (isDemoOrLocal) {
+            isAuthorized = true;
+          } else if (mongoose.Types.ObjectId.isValid(activeRoomId)) {
+            const room = await PrivateRoom.findById(activeRoomId);
+            if (room) {
+              const isOwner = room.ownerId && room.ownerId.toString() === verifiedUserId;
+              const isMember = await PrivateRoomMember.exists({ roomId: room._id, userId: verifiedUserId });
+              isAuthorized = isOwner || isMember;
+            }
+          }
+        }
+
+        if (!isAuthorized) {
+          const err = { success: false, error: 'Unauthorized to view room chat history.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('private_room:error', err);
+        }
+
+        const history = privateRoomChatHistory.has(activeRoomId)
+          ? privateRoomChatHistory.get(activeRoomId)
+          : [];
+
+        if (typeof callback === 'function') {
+          callback({ success: true, messages: history });
+        } else {
+          socket.emit('private_room:chat_history', { roomId: activeRoomId, messages: history });
+        }
+      } catch (err) {
+        console.error('[Socket] private_room:get_chat error:', err);
+        if (typeof callback === 'function') callback({ success: false, error: err.message });
+      }
+    };
+
+    socket.on('private_room:get_chat', handleGetRoomChat);
+    socket.on('friend_lounge:get_chat', handleGetRoomChat);
 
     /**
      * Event: player:wave
@@ -707,6 +1266,36 @@ const initSocket = (io) => {
       // Broadcast to the specific campus area room and campus global
       io.to(`area:${targetArea}`).emit('chat:campus_broadcast', messageObj);
     });
+
+    /**
+     * Event: player_speech & player:speech
+     * Avatar proximity/world speech bubble broadcast across campus
+     */
+    const handlePlayerSpeech = (data = {}) => {
+      const player = players.get(socket.id);
+      const text = String(data.text || data.content || '').trim().substring(0, 100);
+      if (!text) return;
+
+      const userId = player?.userId || socket.user?._id?.toString() || verifiedUserId;
+      const displayName = player?.displayName || socket.user?.name || verifiedName;
+      const area = player?.campusArea || 'main-plaza';
+
+      const speechPayload = {
+        socketId: socket.id,
+        userId,
+        displayName,
+        text,
+        timestamp: new Date().toISOString()
+      };
+
+      io.to('campus:world').emit('player:speech', speechPayload);
+      if (area) {
+        io.to(`area:${area}`).emit('player:speech', speechPayload);
+      }
+    };
+
+    socket.on('player_speech', handlePlayerSpeech);
+    socket.on('player:speech', handlePlayerSpeech);
 
     /**
      * Subscribe / Join private conversation channel
@@ -977,7 +1566,7 @@ const initSocket = (io) => {
         );
 
         if (!isMutedByPartner) {
-          await Notification.create({
+          await notificationService.createAndEmitNotification({
             recipient: partnerId,
             sender: socket.user._id,
             type: 'new_message',
@@ -986,7 +1575,7 @@ const initSocket = (io) => {
             data: {
               conversation_id: conversation._id.toString(),
               message_id: directMessage._id.toString(),
-              actionUrl: `/messages?conversationId=${conversation._id}`
+              actionUrl: '/messages'
             }
           });
         }
@@ -1156,6 +1745,7 @@ const initSocket = (io) => {
           console.log(`[Socket] Student left campus: ${player.displayName} (${socket.id})`);
         }
         players.delete(socket.id);
+        snapshotEngine.unregisterPlayer(socket.id);
 
         // Broadcast to campus world that this player left
         socket.to('campus:world').emit('player:left', {
@@ -1202,6 +1792,32 @@ const initSocket = (io) => {
         });
       }
       seatingManager.vacateUser(verifiedUserId);
+
+      // 5. Datee Homes Lobby Seating cleanup
+      const dcLobbySeat = userLobbySeats.get(verifiedUserId);
+      if (dcLobbySeat) {
+        lobbySeatOccupants.delete(dcLobbySeat);
+        userLobbySeats.delete(verifiedUserId);
+        io.to('campus:world').emit('datee_homes:seat_vacated', {
+          seatId: dcLobbySeat,
+          userId: verifiedUserId,
+          socketId: socket.id
+        });
+      }
+
+      // 6. Private Room presence cleanup
+      const dcPrivateRoomId = socketPrivateRooms.get(socket.id);
+      if (dcPrivateRoomId) {
+        socketPrivateRooms.delete(socket.id);
+        const roomMap = privateRoomOccupants.get(dcPrivateRoomId);
+        if (roomMap) {
+          roomMap.delete(socket.id);
+          socket.to(`room:${dcPrivateRoomId}`).emit('private_room:peer_left', {
+            socketId: socket.id,
+            userId: verifiedUserId
+          });
+        }
+      }
     });
   });
 

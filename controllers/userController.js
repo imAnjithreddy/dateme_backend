@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const User = require('../models/User');
 const { successResponse, errorResponse } = require('../utils/apiResponse');
 const { RELATIONSHIP_INTENTS } = require('../config/constants');
@@ -207,17 +208,45 @@ const updateAvatar = async (req, res, next) => {
 };
 
 /**
- * Get safe profile of another user
+ * Get safe public profile of another user
  * GET /api/users/:id
  */
 const getUserById = async (req, res, next) => {
   try {
-    const user = await User.findById(req.params.id);
-    if (!user || user.isSuspended || user.isBlocked) {
+    const { id } = req.params;
+    if (!id || !mongoose.Types.ObjectId.isValid(id)) {
       return errorResponse(res, 'User profile not found or unavailable.', 404);
     }
 
-    return successResponse(res, { user: user.toSafeJSON() }, 'User profile retrieved.');
+    const user = await User.findById(id);
+    if (!user || user.isSuspended || user.isBlocked || user.isBanned) {
+      return errorResponse(res, 'User profile not found or unavailable.', 404);
+    }
+
+    const safeData = user.toSafeJSON();
+
+    // Security & privacy field stripping for public view
+    delete safeData.email;
+    delete safeData.warnings;
+    delete safeData.warningCount;
+    delete safeData.restrictions;
+    delete safeData.suspendReason;
+    delete safeData.banReason;
+    delete safeData.reportedCount;
+
+    // Respect user privacy toggles
+    if (user.privacySettings?.showAge === false) {
+      delete safeData.age;
+    }
+    if (user.privacySettings?.showLocation === false) {
+      delete safeData.city;
+    }
+    if (user.privacySettings?.showOnlineStatus === false) {
+      safeData.isOnline = false;
+      delete safeData.lastActive;
+    }
+
+    return successResponse(res, { user: safeData }, 'User profile retrieved.');
   } catch (error) {
     next(error);
   }

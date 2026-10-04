@@ -3,6 +3,7 @@ const Connection = require('../models/Connection');
 const Match = require('../models/Match');
 const Block = require('../models/Block');
 const Notification = require('../models/Notification');
+const notificationService = require('../services/notificationService');
 const { successResponse, errorResponse } = require('../utils/apiResponse');
 
 /**
@@ -354,13 +355,13 @@ const sendMessage = async (req, res, next) => {
     );
 
     // Create notification for recipient
-    await Notification.create({
+    await notificationService.createAndEmitNotification({
       recipient: recipientId,
       sender: req.user._id,
       type: 'new_message',
       title: 'New Whisper Message',
       message: `${req.user.name}: "${text.trim().substring(0, 60)}"`,
-      data: { connectionId: connection._id, actionUrl: `/messages?connectionId=${connection._id}` }
+      data: { connectionId: connection._id, actionUrl: '/messages' }
     });
 
     const populated = await Message.findById(message._id).populate('sender', 'name displayName avatar');

@@ -2,6 +2,7 @@ const GameSession = require('../models/GameSession');
 const User = require('../models/User');
 const Connection = require('../models/Connection');
 const Notification = require('../models/Notification');
+const notificationService = require('../services/notificationService');
 const { successResponse, errorResponse } = require('../utils/apiResponse');
 const { awardParticipationXp } = require('../services/gamificationService');
 
@@ -135,16 +136,16 @@ const createInvite = async (req, res, next) => {
       .populate('invitee', 'name displayName avatar');
 
     // Notify invitee via Notification
-    await Notification.create({
+    await notificationService.createAndEmitNotification({
       recipient: targetUserId,
       sender: req.user._id,
-      type: 'connection_request',
+      type: 'game_invite',
       title: `Mini-Game Invite: ${gameType === 'tictactoe' ? 'Tic-Tac-Toe' : 'Campus Trivia'} 🎮`,
       message: `${req.user.name} wants to play a round of ${gameType === 'tictactoe' ? 'Tic-Tac-Toe' : 'Campus Trivia'} with you!`,
       data: {
         gameSessionId: session._id,
         gameType,
-        actionUrl: `/messages?connectionId=${connectionId || ''}`
+        actionUrl: '/messages'
       }
     });
 

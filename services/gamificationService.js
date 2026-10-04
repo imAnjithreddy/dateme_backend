@@ -1,5 +1,6 @@
 const User = require('../models/User');
 const Notification = require('../models/Notification');
+const notificationService = require('./notificationService');
 
 const LEVELS = [
   { level: 1, title: 'Newcomer', minXp: 0, maxXp: 99 },
@@ -178,24 +179,24 @@ async function awardParticipationXp(userId, actionKey, defaultXp = 50, options =
     // Send notifications if leveled up or unlocked badge
     if (notify) {
       if (newLevelInfo.level > previousLevelInfo.level) {
-        await Notification.create({
+        await notificationService.createAndEmitNotification({
           recipient: user._id,
           sender: user._id,
           type: 'campus_event',
           title: `Level Up! Level ${newLevelInfo.level} 🎉`,
           message: `Congratulations! You unlocked the "${newLevelInfo.title}" title on campus.`,
-          data: { level: newLevelInfo.level, title: newLevelInfo.title }
+          data: { level: newLevelInfo.level, title: newLevelInfo.title, actionUrl: '/profile' }
         }).catch(() => {});
       }
 
       for (const badge of newBadgesUnlocked) {
-        await Notification.create({
+        await notificationService.createAndEmitNotification({
           recipient: user._id,
           sender: user._id,
           type: 'campus_event',
           title: `New Badge: ${badge.icon} ${badge.name}`,
           message: badge.description,
-          data: { badgeId: badge.id, badgeName: badge.name }
+          data: { badgeId: badge.id, badgeName: badge.name, actionUrl: '/profile' }
         }).catch(() => {});
       }
     }

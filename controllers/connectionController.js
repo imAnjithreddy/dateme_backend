@@ -1,5 +1,6 @@
 const Connection = require('../models/Connection');
 const Notification = require('../models/Notification');
+const notificationService = require('../services/notificationService');
 const User = require('../models/User');
 const Match = require('../models/Match');
 const Block = require('../models/Block');
@@ -108,7 +109,7 @@ const sendRequest = async (req, res, next) => {
           });
 
           // Notify the other user that mutual connection & match formed
-          await Notification.create({
+          await notificationService.createAndEmitNotification({
             recipient: finalRecipientId,
             sender: req.user._id,
             type: 'connection_accepted',
@@ -149,7 +150,7 @@ const sendRequest = async (req, res, next) => {
     });
 
     // Create notification for recipient
-    await Notification.create({
+    await notificationService.createAndEmitNotification({
       recipient: finalRecipientId,
       sender: req.user._id,
       type: 'connection_request',
@@ -282,7 +283,7 @@ const respondRequest = async (req, res, next) => {
       });
 
       // Create canonical notification for requester
-      await Notification.create({
+      await notificationService.createAndEmitNotification({
         recipient: connection.requester._id,
         sender: req.user._id,
         type: 'connection_accepted',

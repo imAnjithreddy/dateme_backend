@@ -23,6 +23,10 @@ const notificationSchema = new mongoose.Schema(
         'new_message',
         'event_invitation',
         'club_activity',
+        'campus_event',
+        'like_received',
+        'match',
+        'game_invite',
         'system'
       ],
       required: true

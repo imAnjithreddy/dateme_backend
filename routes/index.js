@@ -17,11 +17,13 @@ const friendRoutes = require('./friendRoutes');
 const conversationRoutes = require('./conversationRoutes');
 const systemRoutes = require('./systemRoutes');
 const adminRoutes = require('./adminRoutes');
+const privateRoomRoutes = require('./privateRoomRoutes');
 const { authenticateUser, requireAdmin } = require('../middleware/auth');
 const { successResponse } = require('../utils/apiResponse');
 
 // Core Platform Routes
 router.use('/auth', authRoutes);
+router.use('/private-rooms', privateRoomRoutes);
 router.use('/users', userRoutes);
 router.use('/friends', friendRoutes);
 router.use('/conversations', conversationRoutes);
