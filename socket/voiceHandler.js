@@ -69,12 +69,42 @@ const removeUserFromRoomVoice = (roomId, userId, io) => {
         roomId: roomIdStr,
         userId: userIdStr
       });
+
+      const remainingList = Array.from(session.values()).map((p) => ({
+        userId: p.userId,
+        name: p.name,
+        isMuted: p.isMuted,
+        isSpeaking: p.isSpeaking
+      }));
+      io.to(`room:${roomIdStr}`).emit('voice:room_status', {
+        roomId: roomIdStr,
+        activeCount: session.size,
+        participants: remainingList
+      });
     }
 
     if (session.size === 0) {
       roomVoiceSessions.delete(roomIdStr);
     }
   }
+};
+
+/**
+ * Get active voice status for a room
+ */
+const getRoomVoiceStatus = (roomId) => {
+  if (!roomId) return { activeCount: 0, participants: [] };
+  const session = roomVoiceSessions.get(roomId.toString());
+  if (!session) return { activeCount: 0, participants: [] };
+  return {
+    activeCount: session.size,
+    participants: Array.from(session.values()).map((p) => ({
+      userId: p.userId,
+      name: p.name,
+      isMuted: p.isMuted,
+      isSpeaking: p.isSpeaking
+    }))
+  };
 };
 
 /**
@@ -163,7 +193,7 @@ const removeParticipantFromSession = (channelId, userId, io, userName = null, pl
 /**
  * Attach Voice WebRTC Signaling and Shared Voice Session Handlers to an authenticated socket
  */
-const attachVoiceHandlers = (socket, io, userSockets, players = null) => {
+const attachVoiceHandlers = (socket, io, userSockets, players = null, privateRoomOccupants = null) => {
   const verifiedUserId = socket.user._id.toString();
   const verifiedName = socket.user.name || socket.user.displayName || 'Campus Student';
 
@@ -550,8 +580,10 @@ const attachVoiceHandlers = (socket, io, userSockets, players = null) => {
 
         const isOwner = room.ownerId && room.ownerId.toString() === verifiedUserId;
         const isMember = await PrivateRoomMember.exists({ roomId: room._id, userId: verifiedUserId });
-        if (!isOwner && !isMember) {
-          const err = { success: false, error: 'You are not an authorized member of this lounge.' };
+        const isOccupant = Boolean(privateRoomOccupants && privateRoomOccupants.get(roomIdStr)?.has(socket.id));
+        if (!isOwner && !isMember && !isOccupant) {
+          const roomLabel = room.type === 'COUPLE' ? 'couple suite' : 'lounge';
+          const err = { success: false, error: `You are not an authorized member of this ${roomLabel}.` };
           if (typeof callback === 'function') return callback(err);
           return socket.emit('voice:error', err);
         }
@@ -663,6 +695,19 @@ const attachVoiceHandlers = (socket, io, userSockets, players = null) => {
           isMuted: true,
           isSpeaking: false
         }
+      });
+
+      // Broadcast live room voice status to everyone inside the room
+      const currentParticipants = Array.from(voiceMap.values()).map((p) => ({
+        userId: p.userId,
+        name: p.name,
+        isMuted: p.isMuted,
+        isSpeaking: p.isSpeaking
+      }));
+      io.to(`room:${roomIdStr}`).emit('voice:room_status', {
+        roomId: roomIdStr,
+        activeCount: voiceMap.size,
+        participants: currentParticipants
       });
     } catch (err) {
       console.error('[Voice] voice:room_join error:', err);
@@ -881,6 +926,7 @@ module.exports = {
   endVoiceSessionOnSeatVacate,
   revokeVoiceSessionOnAuthLoss,
   removeUserFromRoomVoice,
+  getRoomVoiceStatus,
   getActiveSessionsCount: () => voiceSessions.size,
   getSession: (channelId) => voiceSessions.get(channelId),
   getChannelId

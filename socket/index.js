@@ -8,7 +8,7 @@ const Block = require('../models/Block');
 const Notification = require('../models/Notification');
 const Connection = require('../models/Connection');
 const notificationService = require('../services/notificationService');
-const { attachVoiceHandlers, handleVoiceDisconnect, endVoiceSessionOnSeatVacate, removeUserFromRoomVoice } = require('./voiceHandler');
+const { attachVoiceHandlers, handleVoiceDisconnect, endVoiceSessionOnSeatVacate, removeUserFromRoomVoice, getRoomVoiceStatus } = require('./voiceHandler');
 const seatingManager = require('./seatingManager');
 const snapshotEngine = require('./snapshotEngine');
 const { attachTimeSyncHandlers } = require('./timeSync');
@@ -326,7 +326,7 @@ const initSocket = (io) => {
     };
 
     // Attach WebRTC Voice Signaling & Call Authorization Handlers
-    attachVoiceHandlers(socket, io, userSockets, players);
+    attachVoiceHandlers(socket, io, userSockets, players, privateRoomOccupants);
 
     /**
      * Event: campus:join
@@ -1011,9 +1011,23 @@ const initSocket = (io) => {
           });
 
           if (!membership && room.ownerId && room.ownerId.toString() !== verifiedUserId) {
-            const err = { success: false, error: 'You are not an authorized member of this private lounge.' };
-            if (typeof callback === 'function') callback(err);
-            return socket.emit('private_room:error', err);
+            const providedCode = (data.code || data.roomCode || '').toString().trim().toUpperCase();
+            if (providedCode && room.roomCode && providedCode === room.roomCode.toUpperCase()) {
+              const currentMembers = await PrivateRoomMember.countDocuments({ roomId: room._id });
+              if (currentMembers < (room.maxPlayers || (room.type === 'FRIENDS' ? 6 : 2))) {
+                membership = await PrivateRoomMember.create({
+                  roomId: room._id,
+                  userId: verifiedUserId,
+                  role: 'MEMBER'
+                });
+              }
+            }
+            if (!membership) {
+              const roomLabel = room.type === 'COUPLE' ? 'couple suite' : 'private lounge';
+              const err = { success: false, error: `You are not an authorized member of this ${roomLabel}.` };
+              if (typeof callback === 'function') callback(err);
+              return socket.emit('private_room:error', err);
+            }
           }
         }
 
@@ -1126,8 +1140,9 @@ const initSocket = (io) => {
         };
         roomMap.set(socket.id, playerState);
 
-        // Notify caller with current room occupants list
+        // Notify caller with current room occupants list and live voice status
         const occupantsList = Array.from(roomMap.values()).filter((p) => p.socketId !== socket.id);
+        const voiceStatus = getRoomVoiceStatus(roomIdStr);
         socket.emit('private_room:joined', {
           roomId: roomIdStr,
           room: {
@@ -1140,7 +1155,8 @@ const initSocket = (io) => {
             theme: room.theme,
             state: room.state
           },
-          occupants: occupantsList
+          occupants: occupantsList,
+          voiceStatus
         });
 
         // Broadcast to other peers inside this room
