@@ -542,9 +542,8 @@ const initSocket = (io) => {
           avatarConfig: socket.user?.avatar || data.avatarConfig || data.avatar
         };
 
-        // Broadcast movement to members inside room:${roomIdStr} and friend-lounge alias
+        // Broadcast movement to members inside room:${roomIdStr}
         socket.to(`room:${roomIdStr}`).emit('private_room:peer_moved', movePayload);
-        socket.to(`friend-lounge:${roomIdStr}`).emit('private_room:peer_moved', movePayload);
         return; // Strictly isolate private room movement from campus:world
       }
 
@@ -1064,10 +1063,6 @@ const initSocket = (io) => {
               socketId: socket.id,
               userId: verifiedUserId
             });
-            socket.to(`friend-lounge:${prevRoomId}`).emit('private_room:peer_left', {
-              socketId: socket.id,
-              userId: verifiedUserId
-            });
           }
           removeUserFromRoomVoice(prevRoomId, verifiedUserId, io);
         }
@@ -1152,9 +1147,6 @@ const initSocket = (io) => {
         socket.to(`room:${roomIdStr}`).emit('private_room:peer_joined', {
           player: playerState
         });
-        socket.to(`friend-lounge:${roomIdStr}`).emit('private_room:peer_joined', {
-          player: playerState
-        });
 
         if (typeof callback === 'function') {
           callback({ success: true, roomId: roomIdStr });
@@ -1195,10 +1187,6 @@ const initSocket = (io) => {
         if (roomMap) {
           roomMap.delete(socket.id);
           socket.to(`room:${activeId}`).emit('private_room:peer_left', {
-            socketId: socket.id,
-            userId: verifiedUserId
-          });
-          socket.to(`friend-lounge:${activeId}`).emit('private_room:peer_left', {
             socketId: socket.id,
             userId: verifiedUserId
           });
@@ -1279,9 +1267,8 @@ const initSocket = (io) => {
           history.shift();
         }
 
-        // Broadcast ONLY to members inside room:${activeRoomId} and friend-lounge:${activeRoomId}
+        // Broadcast ONLY to members inside room:${activeRoomId}
         io.to(`room:${activeRoomId}`).emit('private_room:chat_message', messageObj);
-        io.to(`friend-lounge:${activeRoomId}`).emit('private_room:chat_message', messageObj);
 
         // Also emit peer speech bubble for canvas overlay
         io.to(`room:${activeRoomId}`).emit('private_room:peer_speech', {
