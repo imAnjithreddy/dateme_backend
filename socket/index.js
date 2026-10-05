@@ -407,8 +407,43 @@ const initSocket = (io) => {
      * Authoritative movement validation & client input processing
      */
     const handlePlayerMove = (data = {}) => {
-      const player = players.get(socket.id);
-      if (!player) return;
+      let player = players.get(socket.id);
+      if (!player) {
+        // Self-Healing: if socket sent movement before or instead of campus:join,
+        // dynamically register player in players Map and snapshotEngine
+        const initialArea = VALID_AREAS.includes(data.campusArea || data.zone)
+          ? data.campusArea || data.zone
+          : 'datee-homes-lobby';
+        const posX = typeof data.x === 'number' ? Math.max(0, Math.min(3800, data.x)) : 600;
+        const posZ = typeof data.z === 'number' ? Math.max(0, Math.min(3800, data.z)) : (typeof data.y === 'number' ? data.y : 400);
+        player = {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          name: verifiedName,
+          displayName: verifiedName,
+          role: verifiedRole,
+          avatar: data.avatarConfig || data.avatar || socket.user?.avatar || {},
+          campusArea: initialArea,
+          position: [posX, 0, posZ],
+          rotation: typeof data.rotation === 'string' ? data.rotation : (typeof data.facing === 'string' ? data.facing : 'down'),
+          animationState: data.animationState || 'idle',
+          onlineStatus: 'online',
+          lastActive: Date.now()
+        };
+        players.set(socket.id, player);
+        snapshotEngine.registerPlayer(socket.id, socket.user || player, {
+          x: posX,
+          y: posZ,
+          campusArea: initialArea,
+          direction: player.rotation
+        });
+        if (initialArea === 'datee-homes-lobby') {
+          socket.join('area:datee-homes-lobby');
+        } else {
+          socket.join('campus:world');
+          socket.join(`area:${initialArea}`);
+        }
+      }
 
       const newX = typeof data.x === 'number' ? Math.max(0, Math.min(3800, data.x)) : player.position[0];
       const newY = typeof data.y === 'number' ? data.y : 0;
@@ -541,6 +576,41 @@ const initSocket = (io) => {
     socket.on('player:move', handlePlayerMove);
     socket.on('player_move', handlePlayerMove);
     socket.on('player:move_input', handlePlayerMove);
+
+    /**
+     * Event: player_avatar_update
+     * Instantly broadcast wardrobe outfit changes across campus, lobby, and private rooms
+     */
+    socket.on('player_avatar_update', (data = {}) => {
+      const avatar = data.avatar || data.avatarConfig || {};
+      const player = players.get(socket.id);
+      if (player) {
+        player.avatar = avatar;
+      }
+      if (socket.user) {
+        socket.user.avatar = avatar;
+      }
+      const activePrivateRoomId = socketPrivateRooms.get(socket.id);
+      if (activePrivateRoomId) {
+        io.to(`room:${activePrivateRoomId}`).emit('player:avatar_changed', {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          avatar
+        });
+      }
+      if (player?.campusArea === 'datee-homes-lobby') {
+        io.to('area:datee-homes-lobby').emit('player:avatar_changed', {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          avatar
+        });
+      }
+      io.to('campus:world').emit('player:avatar_changed', {
+        socketId: socket.id,
+        userId: verifiedUserId,
+        avatar
+      });
+    });
 
     /**
      * Event: presence:status
@@ -739,6 +809,31 @@ const initSocket = (io) => {
         occupied[seatId] = rec.userId;
       }
       socket.emit('datee_homes:seats_state', { occupiedSeats: occupied });
+    });
+
+    socket.on('datee_homes:get_occupants', () => {
+      const occupants = [];
+      for (const [sId, p] of players) {
+        if (
+          sId !== socket.id &&
+          (p.campusArea === 'datee-homes-lobby' || p.campusArea === 'DATEE_HOMES_LOBBY') &&
+          !socketPrivateRooms.has(sId)
+        ) {
+          occupants.push({
+            socketId: sId,
+            userId: p.userId,
+            name: p.name || p.displayName || 'Resident',
+            x: p.position?.[0] ?? 600,
+            y: p.position?.[2] ?? 400,
+            facing: typeof p.rotation === 'string' ? p.rotation : 'down',
+            isMoving: p.animationState === 'walk',
+            isSeated: p.animationState === 'sit',
+            animationState: p.animationState || 'idle',
+            avatarConfig: p.avatar || {}
+          });
+        }
+      }
+      socket.emit('datee_homes:occupants_list', { occupants });
     });
 
     socket.on('datee_homes:sit_request', (data = {}) => {
@@ -982,6 +1077,46 @@ const initSocket = (io) => {
         socket.join(`friend-lounge:${roomIdStr}`);
         socketPrivateRooms.set(socket.id, roomIdStr);
 
+        // Vacate any Datee Homes Lobby seat
+        const lobbySeatId = userLobbySeats.get(verifiedUserId);
+        if (lobbySeatId) {
+          lobbySeatOccupants.delete(lobbySeatId);
+          userLobbySeats.delete(verifiedUserId);
+          io.to('campus:world').emit('datee_homes:seat_vacated', {
+            seatId: lobbySeatId,
+            userId: verifiedUserId
+          });
+        }
+
+        // Update player's active campus area to private-room
+        const player = players.get(socket.id);
+        const oldArea = player?.campusArea || 'datee-homes-lobby';
+        if (player) {
+          player.campusArea = 'private-room';
+          player.isSeated = false;
+        }
+        snapshotEngine.setPlayerZone(socket.id, 'private-room');
+
+        // Immediately notify Datee Homes Lobby that this player entered a private room and left the lobby
+        socket.leave('area:datee-homes-lobby');
+        socket.to('area:datee-homes-lobby').emit('player:left_area', {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          oldArea,
+          newArea: 'private-room'
+        });
+        socket.to('campus:world').emit('player:left', {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          campusArea: 'datee-homes-lobby'
+        });
+        socket.to('campus:world').emit('player:area_changed', {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          oldArea,
+          newArea: 'private-room'
+        });
+
         const playerState = {
           socketId: socket.id,
           userId: verifiedUserId,
@@ -1036,6 +1171,26 @@ const initSocket = (io) => {
         socket.leave(`room:${activeId}`);
         socket.leave(`friend-lounge:${activeId}`);
         socketPrivateRooms.delete(socket.id);
+
+        const player = players.get(socket.id);
+        if (player) {
+          player.campusArea = 'datee-homes-lobby';
+          player.isSeated = false;
+        }
+        snapshotEngine.setPlayerZone(socket.id, 'datee-homes-lobby');
+        socket.join('area:datee-homes-lobby');
+        socket.to('area:datee-homes-lobby').emit('player:joined_area', {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          campusArea: 'datee-homes-lobby'
+        });
+        socket.to('campus:world').emit('player:area_changed', {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          oldArea: 'private-room',
+          newArea: 'datee-homes-lobby'
+        });
+
         const roomMap = privateRoomOccupants.get(activeId);
         if (roomMap) {
           roomMap.delete(socket.id);
@@ -1781,6 +1936,18 @@ const initSocket = (io) => {
           socketId: socket.id,
           userId: player.userId
         });
+
+        if (player.campusArea === 'datee-homes-lobby') {
+          socket.to('area:datee-homes-lobby').emit('player:left', {
+            socketId: socket.id,
+            userId: player.userId
+          });
+          socket.to('area:datee-homes-lobby').emit('player:left_area', {
+            socketId: socket.id,
+            userId: player.userId,
+            oldArea: 'datee-homes-lobby'
+          });
+        }
 
         // Broadcast updated presence count
         io.to('campus:world').emit('presence:update', {

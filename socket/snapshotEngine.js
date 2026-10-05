@@ -297,27 +297,30 @@ class SnapshotEngine {
       this.io.to(`area:${area}`).emit('world:snapshot', snapshotPayload);
     }
 
-    // 2. Also emit global world snapshot to campus:world so all global/cross-area observers stay synchronized
-    const allPlayersCompact = Array.from(this.players.values()).map((p) => ({
-      id: p.userId,
-      sId: p.socketId,
-      x: Math.round(p.x * 10) / 10,
-      y: Math.round(p.y * 10) / 10,
-      vx: Math.round(p.vx * 10) / 10,
-      vy: Math.round(p.vy * 10) / 10,
-      dir: p.direction,
-      st: p.movementState,
-      sit: p.isSeated,
-      seat: p.seatId,
-      area: p.campusArea
-    }));
+    // 2. Also emit global world snapshot to campus:world for outdoor campus observers.
+    // Strictly isolate interior players (e.g. private-room, datee-homes-lobby) so they never leak as ghost avatars outdoors.
+    const outdoorPlayersCompact = Array.from(this.players.values())
+      .filter((p) => p.campusArea !== 'private-room' && p.campusArea !== 'datee-homes-lobby')
+      .map((p) => ({
+        id: p.userId,
+        sId: p.socketId,
+        x: Math.round(p.x * 10) / 10,
+        y: Math.round(p.y * 10) / 10,
+        vx: Math.round(p.vx * 10) / 10,
+        vy: Math.round(p.vy * 10) / 10,
+        dir: p.direction,
+        st: p.movementState,
+        sit: p.isSeated,
+        seat: p.seatId,
+        area: p.campusArea
+      }));
 
     this.io.to('campus:world').emit('world:snapshot', {
       serverTimestamp,
       t: serverTimestamp,
       seq: this.sequence,
       sequence: this.sequence,
-      players: allPlayersCompact
+      players: outdoorPlayersCompact
     });
   }
 

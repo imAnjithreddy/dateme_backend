@@ -295,25 +295,17 @@ exports.joinRoom = async (req, res) => {
       );
     }
 
-    // Check Invite-Only constraint if caller is not the owner
+    // Possessing the authoritative 6-character room code shared by the room owner authorizes entry.
+    // If an in-app invitation was pending for this user, mark it as accepted.
     const isOwner = room.ownerId.toString() === userId.toString();
-    if (room.privacy === PRIVATE_ROOM_PRIVACY.INVITE_ONLY && !isOwner) {
+    if (!isOwner) {
       const invitation = await RoomInvitation.findOne({
         roomId: room._id,
         inviteeId: userId,
-        status: { $in: [INVITATION_STATUS.PENDING, INVITATION_STATUS.ACCEPTED] }
+        status: INVITATION_STATUS.PENDING
       });
 
-      if (!invitation) {
-        return errorResponse(
-          res,
-          'This room is invite-only. You need an invitation from the room owner to join.',
-          403,
-          { code: 'INVITATION_REQUIRED' }
-        );
-      }
-
-      if (invitation.status === INVITATION_STATUS.PENDING) {
+      if (invitation) {
         invitation.status = INVITATION_STATUS.ACCEPTED;
         await invitation.save();
       }
