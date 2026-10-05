@@ -139,64 +139,7 @@ exports.getMyRooms = async (req, res) => {
   try {
     const userId = req.user._id;
 
-    // Find all memberships for this user
-    const memberships = await PrivateRoomMember.find({ userId })
-      .select('roomId role joinedAt')
-      .lean();
-
-    if (!memberships || memberships.length === 0) {
-      return successResponse(res, { rooms: [] }, 'No rooms found.', 200);
-    }
-
-    const roomIds = memberships.map((m) => m.roomId);
-    const rooms = await PrivateRoom.find({
-      _id: { $in: roomIds },
-      status: PRIVATE_ROOM_STATUS.ACTIVE
-    })
-      .populate('ownerId', 'name displayName avatar')
-      .sort({ updatedAt: -1 })
-      .lean();
-
-    // Attach membership role, member count, and type details
-    const memberMap = new Map();
-    memberships.forEach((m) => memberMap.set(m.roomId.toString(), m));
-
-    // Calculate members count for each room
-    const memberCounts = await PrivateRoomMember.aggregate([
-      { $match: { roomId: { $in: roomIds } } },
-      { $group: { _id: '$roomId', count: { $sum: 1 } } }
-    ]);
-    const countMap = new Map();
-    memberCounts.forEach((c) => countMap.set(c._id.toString(), c.count));
-
-    const formattedRooms = rooms.map((r) => {
-      const membership = memberMap.get(r._id.toString());
-      const currentMembers = countMap.get(r._id.toString()) || 1;
-      const typeConfig = ROOM_TYPE_CONFIGS[r.type] || ROOM_TYPE_CONFIGS.COUPLE;
-
-      return {
-        id: r._id,
-        _id: r._id,
-        roomCode: r.roomCode,
-        code: r.roomCode,
-        name: r.name,
-        type: r.type,
-        typeName: typeConfig.name,
-        icon: typeConfig.icon,
-        badgeColor: typeConfig.badgeColor,
-        owner: r.ownerId,
-        ownerId: r.ownerId?._id || r.ownerId,
-        isOwner: membership?.role === PRIVATE_ROOM_ROLES.OWNER,
-        role: membership?.role || PRIVATE_ROOM_ROLES.MEMBER,
-        maxPlayers: r.maxPlayers,
-        currentPlayers: currentMembers,
-        privacy: r.privacy,
-        theme: r.theme,
-        createdAt: r.createdAt
-      };
-    });
-
-    // Compute user's weekly creation quota
+    // 1. Compute user's weekly creation quota FIRST so it is always present in response
     const windowStart = new Date(Date.now() - WEEKLY_LIMIT_WINDOW_MS);
     const createdCountThisWeek = await PrivateRoom.countDocuments({
       ownerId: userId,
@@ -220,6 +163,73 @@ exports.getMyRooms = async (req, res) => {
       remainingThisWeek: Math.max(0, MAX_ROOMS_PER_USER_PER_WEEK - createdCountThisWeek),
       resetsAt
     };
+
+    // 2. Find all memberships for this user
+    const memberships = await PrivateRoomMember.find({ userId })
+      .select('roomId role joinedAt')
+      .lean();
+
+    const memberRoomIds = (memberships || []).map((m) => m.roomId);
+
+    // 3. Find all active rooms where user is either an authorized member OR the authoritative owner
+    const rooms = await PrivateRoom.find({
+      $or: [
+        { _id: { $in: memberRoomIds } },
+        { ownerId: userId }
+      ],
+      status: PRIVATE_ROOM_STATUS.ACTIVE
+    })
+      .populate('ownerId', 'name displayName avatar')
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    if (!rooms || rooms.length === 0) {
+      return successResponse(res, { rooms: [], quota }, 'No rooms found.', 200);
+    }
+
+    const allRoomIds = rooms.map((r) => r._id);
+
+    // Attach membership role, member count, and type details
+    const memberMap = new Map();
+    memberships.forEach((m) => memberMap.set(m.roomId.toString(), m));
+
+    // Calculate members count for each room
+    const memberCounts = await PrivateRoomMember.aggregate([
+      { $match: { roomId: { $in: allRoomIds } } },
+      { $group: { _id: '$roomId', count: { $sum: 1 } } }
+    ]);
+    const countMap = new Map();
+    memberCounts.forEach((c) => countMap.set(c._id.toString(), c.count));
+
+    const formattedRooms = rooms.map((r) => {
+      const membership = memberMap.get(r._id.toString());
+      const currentMembers = countMap.get(r._id.toString()) || 1;
+      const typeConfig = ROOM_TYPE_CONFIGS[r.type] || ROOM_TYPE_CONFIGS.COUPLE;
+      const isOwner = r.ownerId?._id
+        ? r.ownerId._id.toString() === userId.toString()
+        : r.ownerId?.toString() === userId.toString();
+
+      return {
+        id: r._id,
+        _id: r._id,
+        roomCode: r.roomCode,
+        code: r.roomCode,
+        name: r.name,
+        type: r.type,
+        typeName: typeConfig.name,
+        icon: typeConfig.icon,
+        badgeColor: typeConfig.badgeColor,
+        owner: r.ownerId,
+        ownerId: r.ownerId?._id || r.ownerId,
+        isOwner: isOwner || membership?.role === PRIVATE_ROOM_ROLES.OWNER,
+        role: membership?.role || (isOwner ? PRIVATE_ROOM_ROLES.OWNER : PRIVATE_ROOM_ROLES.MEMBER),
+        maxPlayers: r.maxPlayers,
+        currentPlayers: currentMembers,
+        privacy: r.privacy,
+        theme: r.theme,
+        createdAt: r.createdAt
+      };
+    });
 
     return successResponse(res, { rooms: formattedRooms, quota }, 'My rooms loaded.');
   } catch (err) {
