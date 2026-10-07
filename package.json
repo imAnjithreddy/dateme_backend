@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --max-old-space-size=2048 --watch --watch-path=config --watch-path=controllers --watch-path=middleware --watch-path=models --watch-path=routes --watch-path=services --watch-path=socket --watch-path=utils --watch-path=server.js server.js"
   },
   "keywords": [
     "virtual-campus",

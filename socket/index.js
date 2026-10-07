@@ -407,6 +407,62 @@ const initSocket = (io) => {
      * Authoritative movement validation & client input processing
      */
     const handlePlayerMove = (data = {}) => {
+      // 1. FAST-PATH: Isolated Private Room Movement (Couple Suite / Friends Lounge)
+      // Bypasses campus snapshot engine to deliver zero latency and eliminate coordinate clamping
+      const activePrivateRoomId = socketPrivateRooms.get(socket.id) || (data.campusArea === 'private-room' ? data.roomId : null);
+      if (activePrivateRoomId) {
+        const roomIdStr = activePrivateRoomId.toString();
+        const roomMap = privateRoomOccupants.get(roomIdStr);
+        const posX = typeof data.x === 'number' ? data.x : 400;
+        const posY = typeof data.y === 'number' ? data.y : 420;
+        const vx = typeof data.vx === 'number' ? data.vx : 0;
+        const vy = typeof data.vy === 'number' ? data.vy : 0;
+        const seq = typeof data.sequence === 'number' ? data.sequence : (typeof data.seq === 'number' ? data.seq : Date.now());
+        const facing = data.facing || (typeof data.rotation === 'string' ? data.rotation : 'down');
+        const isMoving = Boolean(data.isMoving);
+        const isSeated = Boolean(data.isSeated);
+        const isSleeping = Boolean(data.isSleeping || data.animationState === 'sleep');
+        const animState = data.animationState || (isSleeping ? 'sleep' : isSeated ? 'sit' : (isMoving ? 'walk' : 'idle'));
+
+        if (roomMap && roomMap.has(socket.id)) {
+          const rp = roomMap.get(socket.id);
+          rp.x = posX;
+          rp.y = posY;
+          rp.vx = vx;
+          rp.vy = vy;
+          rp.rotation = facing;
+          rp.facing = facing;
+          rp.animationState = animState;
+          rp.isMoving = isMoving;
+          rp.isSeated = isSeated;
+          rp.isSleeping = isSleeping;
+          rp.lastSeq = seq;
+        }
+
+        const movePayload = {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          name: verifiedName,
+          x: posX,
+          y: posY,
+          vx,
+          vy,
+          seq,
+          facing,
+          rotation: facing,
+          animationState: animState,
+          isMoving,
+          isSeated,
+          isSleeping,
+          avatarConfig: socket.user?.avatar || data.avatarConfig || data.avatar,
+          timestamp: data.timestamp || Date.now()
+        };
+
+        // Broadcast directly to members inside room:${roomIdStr}
+        socket.to(`room:${roomIdStr}`).emit('private_room:peer_moved', movePayload);
+        return; // Strictly isolate private room movement from campus:world
+      }
+
       let player = players.get(socket.id);
       if (!player) {
         // Self-Healing: if socket sent movement before or instead of campus:join,
@@ -437,24 +493,21 @@ const initSocket = (io) => {
           campusArea: initialArea,
           direction: player.rotation
         });
-        if (initialArea === 'datee-homes-lobby') {
-          socket.join('area:datee-homes-lobby');
-        } else {
-          socket.join('campus:world');
-          socket.join(`area:${initialArea}`);
-        }
+        socket.join('campus:world');
+        socket.join(`area:${initialArea}`);
       }
 
-      const newX = typeof data.x === 'number' ? Math.max(0, Math.min(3800, data.x)) : player.position[0];
+      const isLobby = (data.campusArea === 'datee-homes-lobby' || data.campusArea === 'DATEE_HOMES_LOBBY' || player.campusArea === 'datee-homes-lobby');
+      const newX = typeof data.x === 'number' ? (isLobby ? data.x : Math.max(0, Math.min(3800, data.x))) : player.position[0];
       const newY = typeof data.y === 'number' ? data.y : 0;
-      const newZ = typeof data.z === 'number' ? Math.max(0, Math.min(3800, data.z)) : player.position[2];
+      const newZ = typeof data.z === 'number' ? (isLobby ? data.z : Math.max(0, Math.min(3800, data.z))) : (typeof data.y === 'number' && isLobby ? data.y : player.position[2]);
       const newRotation = typeof data.rotation === 'number' ? data.rotation : player.rotation;
       const animationState = data.animationState || (data.isMoving ? 'walk' : 'idle');
       const newArea = VALID_AREAS.includes(data.campusArea || data.zone)
         ? data.campusArea || data.zone
         : player.campusArea;
 
-      // Authoritative validation via snapshot engine
+      // Authoritative validation via snapshot engine (primarily for outdoor campus)
       const validated = snapshotEngine.processMovementInput(socket.id, {
         x: newX,
         y: newZ,
@@ -464,7 +517,7 @@ const initSocket = (io) => {
         campusArea: newArea
       });
 
-      if (validated) {
+      if (validated && !isLobby) {
         player.position = [validated.x, 0, validated.y];
         player.rotation = validated.direction;
         player.animationState = validated.movementState;
@@ -505,56 +558,17 @@ const initSocket = (io) => {
         });
       }
 
-      // Check if player is inside an isolated private room
-      const activePrivateRoomId = socketPrivateRooms.get(socket.id) || (data.campusArea === 'private-room' ? data.roomId : null);
-      if (activePrivateRoomId) {
-        const roomIdStr = activePrivateRoomId.toString();
-        const roomMap = privateRoomOccupants.get(roomIdStr);
-        const posX = typeof data.x === 'number' ? data.x : (typeof data.position?.[0] === 'number' ? data.position[0] : 400);
-        const posY = typeof data.y === 'number' ? data.y : (typeof data.z === 'number' ? data.z : (typeof data.position?.[2] === 'number' ? data.position[2] : 420));
-        const facing = data.facing || (typeof data.rotation === 'string' ? data.rotation : 'down');
-        const isMoving = Boolean(data.isMoving);
-        const isSeated = Boolean(data.isSeated);
-        const animState = data.animationState || (isSeated ? 'sit' : (isMoving ? 'walk' : 'idle'));
-
-        if (roomMap && roomMap.has(socket.id)) {
-          const rp = roomMap.get(socket.id);
-          rp.x = posX;
-          rp.y = posY;
-          rp.rotation = facing;
-          rp.facing = facing;
-          rp.animationState = animState;
-          rp.isMoving = isMoving;
-          rp.isSeated = isSeated;
-        }
-
-        const movePayload = {
-          socketId: socket.id,
-          userId: verifiedUserId,
-          name: verifiedName,
-          x: posX,
-          y: posY,
-          facing,
-          rotation: facing,
-          animationState: animState,
-          isMoving,
-          isSeated,
-          avatarConfig: socket.user?.avatar || data.avatarConfig || data.avatar
-        };
-
-        // Broadcast movement to members inside room:${roomIdStr}
-        socket.to(`room:${roomIdStr}`).emit('private_room:peer_moved', movePayload);
-        return; // Strictly isolate private room movement from campus:world
-      }
-
-      // Backward-compatible legacy broadcast for any non-snapshot listeners (including DateeHomesLobby)
+      // Backward-compatible broadcast for listeners (including DateeHomesLobby)
       const posX = player.position[0];
       const posY = player.position[2]; // 2D vertical coordinate corresponds to 3D z
       const facing = typeof player.rotation === 'string' ? player.rotation : (typeof data.facing === 'string' ? data.facing : 'down');
-      const isMoving = player.animationState === 'walk';
-      const isSeated = player.animationState === 'sit';
+      const isMoving = data.isMoving !== undefined ? Boolean(data.isMoving) : player.animationState === 'walk';
+      const isSeated = data.isSeated !== undefined ? Boolean(data.isSeated) : player.animationState === 'sit';
+      const vx = typeof data.vx === 'number' ? data.vx : 0;
+      const vy = typeof data.vy === 'number' ? data.vy : 0;
+      const seq = typeof data.sequence === 'number' ? data.sequence : (typeof data.seq === 'number' ? data.seq : Date.now());
 
-      socket.to('campus:world').emit('player:moved', {
+      const legacyMovePayload = {
         socketId: socket.id,
         userId: player.userId,
         name: player.name || verifiedName || 'Resident',
@@ -562,14 +576,24 @@ const initSocket = (io) => {
         x: posX,
         y: posY,
         z: posY,
+        vx,
+        vy,
+        seq,
+        sequence: seq,
         rotation: facing,
         facing,
-        animationState: player.animationState,
+        animationState: data.animationState || player.animationState,
         isMoving,
         isSeated,
         campusArea: player.campusArea,
-        avatarConfig: socket.user?.avatar || player.avatar || {}
-      });
+        avatarConfig: socket.user?.avatar || player.avatar || {},
+        timestamp: data.timestamp || Date.now()
+      };
+
+      socket.to('campus:world').emit('player:moved', legacyMovePayload);
+      if (player.campusArea === 'datee-homes-lobby' || player.campusArea === 'DATEE_HOMES_LOBBY') {
+        socket.to('area:datee-homes-lobby').emit('player:moved', legacyMovePayload);
+      }
     };
 
     socket.on('player:move', handlePlayerMove);
@@ -811,6 +835,29 @@ const initSocket = (io) => {
     });
 
     socket.on('datee_homes:get_occupants', () => {
+      socket.join('campus:world');
+      socket.join('area:datee-homes-lobby');
+
+      const callerPlayer = players.get(socket.id);
+      if (callerPlayer) {
+        callerPlayer.campusArea = 'datee-homes-lobby';
+        snapshotEngine.setPlayerZone(socket.id, 'datee-homes-lobby');
+
+        // Immediately notify existing occupants in lobby that a new player entered
+        socket.to('area:datee-homes-lobby').emit('datee_homes:occupant_joined', {
+          socketId: socket.id,
+          userId: callerPlayer.userId,
+          name: callerPlayer.name || verifiedName || 'Resident',
+          x: callerPlayer.position?.[0] ?? 600,
+          y: callerPlayer.position?.[2] ?? 400,
+          facing: typeof callerPlayer.rotation === 'string' ? callerPlayer.rotation : 'down',
+          isMoving: callerPlayer.animationState === 'walk',
+          isSeated: callerPlayer.animationState === 'sit',
+          animationState: callerPlayer.animationState || 'idle',
+          avatarConfig: socket.user?.avatar || callerPlayer.avatar || {}
+        });
+      }
+
       const occupants = [];
       for (const [sId, p] of players) {
         if (
@@ -1136,6 +1183,8 @@ const initSocket = (io) => {
           rotation: 'down',
           animationState: 'idle',
           isMoving: false,
+          isSeated: false,
+          isSleeping: false,
           avatarConfig: socket.user?.avatar || data.avatar || {}
         };
         roomMap.set(socket.id, playerState);
