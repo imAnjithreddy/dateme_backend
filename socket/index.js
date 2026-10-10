@@ -43,6 +43,10 @@ const VALID_AREAS = [
 const lobbySeatOccupants = new Map(); // seatId -> { userId, socketId }
 const userLobbySeats = new Map();     // userId -> seatId
 
+// Datee Homes Lobby In-Memory Chat History (Max 50 messages, isolated to area:datee-homes-lobby)
+const lobbyChatHistory = [];
+const LOBBY_CHAT_MAX_HISTORY = 50;
+
 // Datee Homes Private Room live occupants tracking: roomId -> Map(socketId, playerState)
 const privateRoomOccupants = new Map();
 const socketPrivateRooms = new Map(); // socketId -> roomId
@@ -974,6 +978,114 @@ const initSocket = (io) => {
         standX: seat?.standX,
         standY: seat?.standY
       });
+    });
+
+    /**
+     * Datee Homes Lobby Public Chat Events (Strictly Isolated to area:datee-homes-lobby)
+     * Authoritative rate-limiting, sender validation, and speech bubble broadcast
+     */
+    socket.on('datee_homes:get_chat', (callback) => {
+      try {
+        if (!verifiedUserId) {
+          const err = { success: false, error: 'Authentication required to access lobby chat.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('datee_homes:error', err);
+        }
+
+        const callerPlayer = players.get(socket.id);
+        const isInLobby = (callerPlayer && (callerPlayer.campusArea === 'datee-homes-lobby' || callerPlayer.campusArea === 'DATEE_HOMES_LOBBY')) || socket.rooms.has('area:datee-homes-lobby');
+        if (!isInLobby) {
+          const err = { success: false, error: 'You must be inside Datee Homes Lobby to access chat.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('datee_homes:error', err);
+        }
+
+        if (typeof callback === 'function') {
+          callback({ success: true, messages: lobbyChatHistory });
+        } else {
+          socket.emit('datee_homes:chat_history', { messages: lobbyChatHistory });
+        }
+      } catch (err) {
+        console.error('[Socket] datee_homes:get_chat error:', err);
+        if (typeof callback === 'function') callback({ success: false, error: err.message });
+      }
+    });
+
+    socket.on('datee_homes:send_chat', (data = {}, callback) => {
+      try {
+        if (!verifiedUserId) {
+          const err = { success: false, error: 'Authentication required to send chat messages.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('datee_homes:error', err);
+        }
+
+        // Rate limit: max 5 messages per 3 seconds per user
+        const now = Date.now();
+        let rate = chatRateLimits.get(verifiedUserId);
+        if (!rate || now - rate.resetAt > 3000) {
+          rate = { count: 0, resetAt: now + 3000 };
+          chatRateLimits.set(verifiedUserId, rate);
+        }
+        rate.count++;
+        if (rate.count > 5) {
+          const err = { success: false, error: 'You are sending messages too quickly. Please slow down.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('datee_homes:error', err);
+        }
+
+        const callerPlayer = players.get(socket.id);
+        const isInLobby = (callerPlayer && (callerPlayer.campusArea === 'datee-homes-lobby' || callerPlayer.campusArea === 'DATEE_HOMES_LOBBY')) || socket.rooms.has('area:datee-homes-lobby');
+        if (!isInLobby) {
+          const err = { success: false, error: 'You must be inside Datee Homes Lobby to send chat messages.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('datee_homes:error', err);
+        }
+
+        const text = String(data.text || '').trim();
+        if (!text) {
+          const err = { success: false, error: 'Message cannot be empty.' };
+          if (typeof callback === 'function') callback(err);
+          return socket.emit('datee_homes:error', err);
+        }
+
+        const cleanText = text.substring(0, 300);
+        const senderAvatar = socket.user?.avatar || data.avatar || (callerPlayer ? callerPlayer.avatar : {});
+        const senderName = socket.user?.name || verifiedName || (callerPlayer ? callerPlayer.name : 'Resident');
+
+        const messageObj = {
+          id: `dh_msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+          area: 'datee-homes-lobby',
+          senderId: verifiedUserId,
+          senderName: senderName,
+          senderAvatar: senderAvatar,
+          text: cleanText,
+          timestamp: new Date().toISOString()
+        };
+
+        lobbyChatHistory.push(messageObj);
+        if (lobbyChatHistory.length > LOBBY_CHAT_MAX_HISTORY) {
+          lobbyChatHistory.shift();
+        }
+
+        // STRICT ISOLATION: Broadcast ONLY to occupants currently inside area:datee-homes-lobby
+        io.to('area:datee-homes-lobby').emit('datee_homes:chat_message', messageObj);
+
+        // Also emit peer speech bubble for in-canvas cartoon bubble overlay
+        io.to('area:datee-homes-lobby').emit('datee_homes:peer_speech', {
+          socketId: socket.id,
+          userId: verifiedUserId,
+          displayName: senderName,
+          text: cleanText,
+          timestamp: messageObj.timestamp
+        });
+
+        if (typeof callback === 'function') {
+          callback({ success: true, message: messageObj });
+        }
+      } catch (err) {
+        console.error('[Socket] datee_homes:send_chat error:', err);
+        if (typeof callback === 'function') callback({ success: false, error: err.message });
+      }
     });
 
     /**
