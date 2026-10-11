@@ -164,9 +164,14 @@ class SnapshotEngine {
       validatedVx = Math.cos(angle) * allowedSpeed;
       validatedVy = Math.sin(angle) * allowedSpeed;
     } else if (distanceMoved > 0.5) {
-      // Valid continuous movement
-      validatedVx = dx / dt;
-      validatedVy = dy / dt;
+      // Valid continuous movement: use client-provided velocity if within bounds, else compute from displacement
+      if (typeof inputData.vx === 'number' && typeof inputData.vy === 'number' && (Math.hypot(inputData.vx, inputData.vy) <= allowedSpeed + 30)) {
+        validatedVx = inputData.vx;
+        validatedVy = inputData.vy;
+      } else {
+        validatedVx = dx / dt;
+        validatedVy = dy / dt;
+      }
     }
 
     // 2B. Authoritative Interior Collision Validation (Datee Homes Lobby)

@@ -459,7 +459,7 @@ const initSocket = (io) => {
           isSeated,
           isSleeping,
           avatarConfig: socket.user?.avatar || data.avatarConfig || data.avatar,
-          timestamp: data.timestamp || Date.now()
+          timestamp: Date.now()
         };
 
         // Broadcast directly to members inside room:${roomIdStr}
@@ -511,10 +511,15 @@ const initSocket = (io) => {
         ? data.campusArea || data.zone
         : player.campusArea;
 
+      const vx = typeof data.vx === 'number' ? data.vx : 0;
+      const vy = typeof data.vy === 'number' ? data.vy : 0;
+
       // Authoritative validation via snapshot engine (primarily for outdoor campus)
       const validated = snapshotEngine.processMovementInput(socket.id, {
         x: newX,
         y: newZ,
+        vx,
+        vy,
         sequence: data.sequence,
         direction: newRotation,
         movementState: animationState,
@@ -591,7 +596,8 @@ const initSocket = (io) => {
         isSeated,
         campusArea: player.campusArea,
         avatarConfig: socket.user?.avatar || player.avatar || {},
-        timestamp: data.timestamp || Date.now()
+        timestamp: Date.now(),
+        serverTimestamp: Date.now()
       };
 
       socket.to('campus:world').emit('player:moved', legacyMovePayload);
