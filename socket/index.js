@@ -573,8 +573,6 @@ const initSocket = (io) => {
       const facing = typeof player.rotation === 'string' ? player.rotation : (typeof data.facing === 'string' ? data.facing : 'down');
       const isMoving = data.isMoving !== undefined ? Boolean(data.isMoving) : player.animationState === 'walk';
       const isSeated = data.isSeated !== undefined ? Boolean(data.isSeated) : player.animationState === 'sit';
-      const vx = typeof data.vx === 'number' ? data.vx : 0;
-      const vy = typeof data.vy === 'number' ? data.vy : 0;
       const seq = typeof data.sequence === 'number' ? data.sequence : (typeof data.seq === 'number' ? data.seq : Date.now());
 
       const legacyMovePayload = {
